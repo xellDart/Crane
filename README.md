@@ -108,38 +108,56 @@ huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --local-dir checkp
 
 ## Start the Server
 
-### Foreground
+Use `crane-ctl` to manage the server:
 
 ```bash
+# Start as daemon
+crane-ctl start --model-path checkpoints/qwen3_vl_2b --model-type qwen3_vl
+
+# Start on a custom port
+crane-ctl start --model-path checkpoints/qwen3_vl_2b --model-type qwen3_vl --port 9090
+
+# Start in foreground (for debugging)
+crane-ctl start --model-path checkpoints/qwen3_vl_2b --model-type qwen3_vl -f
+```
+
+### Manage the server
+
+```bash
+crane-ctl status     # PID, memory, health, model info
+crane-ctl log        # Tail logs (Ctrl+C to exit)
+crane-ctl health     # Quick health check
+crane-ctl restart    # Restart with last config (remembers model + port)
+crane-ctl stop       # Stop the server
+```
+
+### crane-ctl commands
+
+| Command | Description |
+|---------|-------------|
+| `start` | Start the server as a daemon (or `-f` for foreground) |
+| `stop` | Graceful shutdown (SIGTERM, then SIGKILL after 10s) |
+| `restart` | Stop + start with last used config |
+| `status` | Show PID, memory, model, port, health |
+| `log` | Tail server logs (live if running, last 50 lines if stopped) |
+| `health` | Quick `GET /health` check |
+
+After the first `start`, `crane-ctl restart` remembers your `--model-path`, `--model-type` and `--port`.
+
+### Manual start (without crane-ctl)
+
+```bash
+# Foreground
 ./target/release/crane-oai \
   --model-path checkpoints/qwen3_vl_2b \
   --model-type qwen3_vl \
   --port 8080
-```
 
-### Daemon (background)
-
-```bash
+# Daemon
 nohup ./target/release/crane-oai \
   --model-path checkpoints/qwen3_vl_2b \
   --model-type qwen3_vl \
   --port 8080 > crane-oai.log 2>&1 &
-
-echo $! > crane-oai.pid
-```
-
-### Manage the daemon
-
-```bash
-tail -f crane-oai.log              # View logs
-curl localhost:8080/health          # Health check
-kill $(cat crane-oai.pid)           # Stop server
-```
-
-### Or use the installer directly
-
-```bash
-bash install.sh --model-path checkpoints/qwen3_vl_2b --model-type qwen3_vl --daemon --port 8080
 ```
 
 ---
@@ -307,6 +325,7 @@ Crane/
 │       ├── engine/          # Inference engine, model factory, continuous batching
 │       └── handlers/        # HTTP handlers (OpenAI, SGLang)
 ├── example/                 # Example binaries
+├── crane-ctl                # Server management CLI (start/stop/log/status)
 ├── build.sh                 # Auto-detect build script
 ├── install.sh               # Curl-installable setup script
 └── Cargo.toml               # Workspace
