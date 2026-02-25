@@ -23,8 +23,6 @@ use engine::{EngineHandle, InferenceEngine, MemoryConfig};
 use handlers::tts::TtsGenerateRequest;
 use handlers::vlm::VlmRequest;
 use openai_api::ErrorResponse;
-use crane_core::models::paddleocr_vl::PaddleOcrVL;
-
 // ═════════════════════════════════════════════════════════════
 //  CLI
 // ═════════════════════════════════════════════════════════════

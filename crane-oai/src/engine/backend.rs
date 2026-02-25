@@ -315,7 +315,7 @@ impl ModelBackend for Qwen25Backend {
 
 pub struct Qwen3Backend {
     pub model: crane_core::models::qwen3::Model,
-    dtype: DType,
+    _dtype: DType,
 }
 
 impl Qwen3Backend {
@@ -323,7 +323,7 @@ impl Qwen3Backend {
         let model = crane_core::models::qwen3::Model::new(model_path, device, dtype)?;
         Ok(Self {
             model,
-            dtype: *dtype,
+            _dtype: *dtype,
         })
     }
 }

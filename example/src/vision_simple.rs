@@ -17,7 +17,7 @@ fn main() -> CraneResult<()> {
     };
     
     // Create a new vision client
-    let vision_client = VisionClient::new(config)?;
+    let _vision_client = VisionClient::new(config)?;
     
     // Analyze an image (this is a placeholder - actual implementation depends on available models)
     // let result = vision_client.analyze_image("path/to/your/image.jpg")?;

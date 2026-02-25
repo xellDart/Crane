@@ -19,7 +19,7 @@ impl TtsClient {
     pub fn text_to_speech<P: AsRef<Path>>(&self, text: &str, output_file: P) -> CraneResult<()> {
         // For now, we'll use the SparkTTS model as an example
         // In a real implementation, we would use the appropriate TTS model
-        let device = match &self.config.device {
+        let _device = match &self.config.device {
             DeviceConfig::Cpu => crane_core::models::Device::Cpu,
             DeviceConfig::Cuda(gpu_id) => crane_core::models::Device::cuda_if_available(*gpu_id as usize)
                 .map_err(|e| CraneError::ModelError(e.to_string()))?,

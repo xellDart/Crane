@@ -515,7 +515,7 @@ enum MlpGateUp {
     /// Merged gate+up weight — one gemv instead of two. Standard (BF16/F16/F32) only.
     Merged { gate_up_proj: Linear, intermediate_size: usize },
     /// Separate quantized gate and up projections (GGUF).
-    Separate { gate_proj: LinearLayer, up_proj: LinearLayer, intermediate_size: usize },
+    Separate { gate_proj: LinearLayer, up_proj: LinearLayer, _intermediate_size: usize },
 }
 
 struct Mlp {
@@ -561,7 +561,7 @@ impl Mlp {
             gate_up: MlpGateUp::Separate {
                 gate_proj,
                 up_proj,
-                intermediate_size,
+                _intermediate_size: intermediate_size,
             },
             down_proj,
         })
