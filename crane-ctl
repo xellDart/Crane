@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─────────────────────────────────────────────────────────────────────
+# crane-ctl — Crane server management CLI
+#
+# Usage:
+#   crane-ctl start --model-path /path/to/model --model-type qwen3_vl
+#   crane-ctl stop
+#   crane-ctl restart
+#   crane-ctl log
+#   crane-ctl status
+#   crane-ctl health
+# ─────────────────────────────────────────────────────────────────────
+
+# ── Find Crane directory ──
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/Cargo.toml" ] && [ -d "$SCRIPT_DIR/crane-core" ]; then
+  CRANE_DIR="$SCRIPT_DIR"
+else
+  CRANE_DIR="${CRANE_HOME:-$HOME/Crane}"
+fi
+
+CRANE_BIN="$CRANE_DIR/target/release/crane-oai"
+CRANE_LOG="$CRANE_DIR/crane-oai.log"
+CRANE_PID_FILE="$CRANE_DIR/crane-oai.pid"
+CRANE_CONF="$CRANE_DIR/.crane-ctl.conf"
+
+# ── Colors ──
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+info()  { echo -e "${BLUE}${BOLD}[crane]${RESET} $*"; }
+ok()    { echo -e "${GREEN}${BOLD}[crane]${RESET} $*"; }
+warn()  { echo -e "${YELLOW}${BOLD}[crane]${RESET} $*"; }
+err()   { echo -e "${RED}${BOLD}[crane]${RESET} $*"; }
+
+# ── Get PID if running ──
+get_pid() {
+  if [ -f "$CRANE_PID_FILE" ]; then
+    local pid
+    pid=$(cat "$CRANE_PID_FILE" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "$pid"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# ── Save last used config ──
+save_conf() {
+  local model_path="$1" model_type="$2" port="$3"
+  cat > "$CRANE_CONF" << EOF
+MODEL_PATH="$model_path"
+MODEL_TYPE="$model_type"
+PORT="$port"
+EOF
+}
+
+# ── Load last used config ──
+load_conf() {
+  if [ -f "$CRANE_CONF" ]; then
+    # shellcheck disable=SC1090
+    source "$CRANE_CONF"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════
+#  Commands
+# ═════════════════════════════════════════════════════════════════════
+
+cmd_start() {
+  local MODEL_PATH="" MODEL_TYPE="" PORT=8080
+
+  # Load previous config as defaults
+  load_conf
+
+  # Parse args
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --model-path)  MODEL_PATH="$2"; shift 2 ;;
+      --model-path=*) MODEL_PATH="${1#--model-path=}"; shift ;;
+      --model-type)  MODEL_TYPE="$2"; shift 2 ;;
+      --model-type=*) MODEL_TYPE="${1#--model-type=}"; shift ;;
+      --port)        PORT="$2"; shift 2 ;;
+      --port=*)      PORT="${1#--port=}"; shift ;;
+      -f|--foreground) FOREGROUND=true; shift ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$MODEL_PATH" ]; then
+    err "Missing --model-path"
+    echo ""
+    echo "  Usage: crane-ctl start --model-path /path/to/model --model-type qwen3_vl [--port 8080]"
+    echo ""
+    if [ -f "$CRANE_CONF" ]; then
+      load_conf
+      echo -e "  ${DIM}Last used: --model-path $MODEL_PATH --model-type $MODEL_TYPE --port $PORT${RESET}"
+      echo ""
+    fi
+    exit 1
+  fi
+
+  if [ -z "$MODEL_TYPE" ]; then
+    err "Missing --model-type (qwen3, qwen3_vl, hunyuan, paddleocr_vl, qwen3_tts)"
+    exit 1
+  fi
+
+  if [ ! -f "$CRANE_BIN" ]; then
+    err "Binary not found: $CRANE_BIN"
+    echo "  Run: cd $CRANE_DIR && bash build.sh"
+    exit 1
+  fi
+
+  if [ ! -d "$MODEL_PATH" ]; then
+    err "Model directory not found: $MODEL_PATH"
+    exit 1
+  fi
+
+  # Check if already running
+  if pid=$(get_pid); then
+    warn "Already running (PID $pid). Use 'crane-ctl restart' or 'crane-ctl stop' first."
+    exit 1
+  fi
+
+  # Save config for next time
+  save_conf "$MODEL_PATH" "$MODEL_TYPE" "$PORT"
+
+  # Foreground mode
+  if [ "${FOREGROUND:-false}" = true ]; then
+    info "Starting in foreground on port $PORT..."
+    exec "$CRANE_BIN" \
+      --model-path "$MODEL_PATH" \
+      --model-type "$MODEL_TYPE" \
+      --port "$PORT"
+  fi
+
+  # Daemon mode
+  info "Starting daemon on port $PORT..."
+  info "Model: $MODEL_PATH ($MODEL_TYPE)"
+
+  nohup "$CRANE_BIN" \
+    --model-path "$MODEL_PATH" \
+    --model-type "$MODEL_TYPE" \
+    --port "$PORT" \
+    > "$CRANE_LOG" 2>&1 &
+
+  local daemon_pid=$!
+  echo "$daemon_pid" > "$CRANE_PID_FILE"
+
+  # Wait and verify
+  sleep 3
+  if kill -0 "$daemon_pid" 2>/dev/null; then
+    ok "Started (PID $daemon_pid)"
+    echo ""
+    echo -e "  ${DIM}Logs:    crane-ctl log${RESET}"
+    echo -e "  ${DIM}Status:  crane-ctl status${RESET}"
+    echo -e "  ${DIM}Stop:    crane-ctl stop${RESET}"
+    echo ""
+  else
+    err "Failed to start. Check logs:"
+    echo "  crane-ctl log"
+    exit 1
+  fi
+}
+
+cmd_stop() {
+  if pid=$(get_pid); then
+    info "Stopping (PID $pid)..."
+    kill "$pid" 2>/dev/null
+
+    # Wait for graceful shutdown (up to 10s)
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && [ $i -lt 10 ]; do
+      sleep 1
+      i=$((i + 1))
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+      warn "Still running after 10s, sending SIGKILL..."
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    rm -f "$CRANE_PID_FILE"
+    ok "Stopped"
+  else
+    warn "Not running"
+  fi
+}
+
+cmd_restart() {
+  cmd_stop
+  sleep 1
+
+  # Reload saved config
+  load_conf
+
+  if [ -z "${MODEL_PATH:-}" ]; then
+    err "No saved config. Use: crane-ctl start --model-path ... --model-type ..."
+    exit 1
+  fi
+
+  cmd_start --model-path "$MODEL_PATH" --model-type "$MODEL_TYPE" --port "${PORT:-8080}"
+}
+
+cmd_status() {
+  if pid=$(get_pid); then
+    ok "Running (PID $pid)"
+    echo ""
+
+    # Show process info
+    local rss
+    rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [ -n "$rss" ]; then
+      local mem_mb=$((rss / 1024))
+      echo "  PID:     $pid"
+      echo "  Memory:  ${mem_mb} MB"
+    fi
+
+    # Show config
+    if [ -f "$CRANE_CONF" ]; then
+      load_conf
+      echo "  Model:   ${MODEL_PATH:-unknown}"
+      echo "  Type:    ${MODEL_TYPE:-unknown}"
+      echo "  Port:    ${PORT:-8080}"
+    fi
+
+    # Try health check
+    local port="${PORT:-8080}"
+    local health
+    health=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$port/health" 2>/dev/null || echo "000")
+    if [ "$health" = "200" ]; then
+      echo -e "  Health:  ${GREEN}OK${RESET}"
+    else
+      echo -e "  Health:  ${YELLOW}unreachable (HTTP $health)${RESET}"
+    fi
+    echo ""
+  else
+    warn "Not running"
+    if [ -f "$CRANE_CONF" ]; then
+      load_conf
+      echo ""
+      echo "  Last config:"
+      echo "    Model: ${MODEL_PATH:-?}"
+      echo "    Type:  ${MODEL_TYPE:-?}"
+      echo "    Port:  ${PORT:-8080}"
+      echo ""
+      echo "  Start with: crane-ctl start --model-path $MODEL_PATH --model-type $MODEL_TYPE"
+      echo ""
+    fi
+  fi
+}
+
+cmd_log() {
+  local lines="${1:-50}"
+  if [ ! -f "$CRANE_LOG" ]; then
+    warn "No log file found at $CRANE_LOG"
+    exit 1
+  fi
+
+  if pid=$(get_pid); then
+    ok "Tailing logs (PID $pid). Press Ctrl+C to exit."
+    echo ""
+    tail -f -n "$lines" "$CRANE_LOG"
+  else
+    info "Showing last $lines lines (server not running):"
+    echo ""
+    tail -n "$lines" "$CRANE_LOG"
+  fi
+}
+
+cmd_health() {
+  local port="${PORT:-8080}"
+  load_conf
+  port="${PORT:-8080}"
+
+  if ! pid=$(get_pid); then
+    err "Not running"
+    exit 1
+  fi
+
+  local response
+  response=$(curl -s "http://localhost:$port/health" 2>/dev/null) || {
+    err "Cannot reach http://localhost:$port/health"
+    exit 1
+  }
+  ok "$response"
+}
+
+cmd_help() {
+  cat << 'USAGE'
+crane-ctl — Crane server management
+
+Commands:
+  start     Start the server as a daemon
+  stop      Stop the running server
+  restart   Restart (stop + start with last config)
+  status    Show server status, memory, health
+  log       Tail server logs (Ctrl+C to exit)
+  health    Quick health check
+  help      Show this help
+
+Start options:
+  --model-path <path>   Path to model directory (required)
+  --model-type <type>   Model type: qwen3, qwen3_vl, hunyuan, paddleocr_vl, qwen3_tts
+  --port <port>         Server port (default: 8080)
+  -f, --foreground      Run in foreground instead of daemon
+
+Examples:
+  crane-ctl start --model-path checkpoints/qwen3_vl_2b --model-type qwen3_vl
+  crane-ctl start --model-path checkpoints/qwen3_vl_2b --model-type qwen3_vl --port 9090
+  crane-ctl log
+  crane-ctl status
+  crane-ctl restart
+  crane-ctl stop
+
+After first start, 'crane-ctl restart' remembers your model and port.
+USAGE
+}
+
+# ═════════════════════════════════════════════════════════════════════
+#  Main
+# ═════════════════════════════════════════════════════════════════════
+
+COMMAND="${1:-help}"
+shift || true
+
+case "$COMMAND" in
+  start)     cmd_start "$@" ;;
+  stop)      cmd_stop ;;
+  restart)   cmd_restart ;;
+  status|ps) cmd_status ;;
+  log|logs)  cmd_log "$@" ;;
+  health)    cmd_health ;;
+  help|-h|--help) cmd_help ;;
+  *)
+    err "Unknown command: $COMMAND"
+    echo ""
+    cmd_help
+    exit 1
+    ;;
+esac

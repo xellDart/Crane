@@ -301,6 +301,28 @@ for bin in crane-oai chat_simple qwen3_vl_simple hunyuan_simple; do
   [ -f "target/release/$bin" ] && BUILT=$((BUILT + 1))
 done
 ok "$BUILT binaries in target/release/"
+
+# ── Install crane-ctl to PATH ──
+if [ -f "$CRANE_DIR/crane-ctl" ]; then
+  chmod +x "$CRANE_DIR/crane-ctl"
+  LINK_DIR="$HOME/.local/bin"
+  mkdir -p "$LINK_DIR"
+  ln -sf "$CRANE_DIR/crane-ctl" "$LINK_DIR/crane-ctl"
+
+  # Ensure ~/.local/bin is in PATH
+  if ! echo "$PATH" | tr ':' '\n' | grep -q "$LINK_DIR"; then
+    SHELL_RC=""
+    if [ -f "$HOME/.bashrc" ]; then SHELL_RC="$HOME/.bashrc";
+    elif [ -f "$HOME/.zshrc" ]; then SHELL_RC="$HOME/.zshrc";
+    fi
+    if [ -n "$SHELL_RC" ] && ! grep -q '.local/bin' "$SHELL_RC" 2>/dev/null; then
+      echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_RC"
+      info "Added ~/.local/bin to PATH in $SHELL_RC (restart shell or run: source $SHELL_RC)"
+    fi
+    export PATH="$LINK_DIR:$PATH"
+  fi
+  ok "crane-ctl installed to $LINK_DIR/crane-ctl"
+fi
 echo ""
 
 # ═════════════════════════════════════════════════════════════════════
@@ -457,38 +479,18 @@ if [ "$SERVER_STARTED" = true ]; then
 fi
 echo ""
 
-# ── How to start the server ──
-echo -e "${BOLD}  How to start the server:${RESET}"
-echo ""
 SHOW_MODEL_PATH="${MODEL_PATH:-/path/to/model}"
 SHOW_MODEL_TYPE="${MODEL_TYPE:-qwen3_vl}"
 
-echo "    # Foreground"
-echo "    $CRANE_BIN \\"
-echo "      --model-path $SHOW_MODEL_PATH \\"
-echo "      --model-type $SHOW_MODEL_TYPE \\"
-echo "      --port $PORT"
+# ── crane-ctl usage ──
+echo -e "${BOLD}  Server management (crane-ctl):${RESET}"
 echo ""
-echo "    # Daemon (background)"
-echo "    nohup $CRANE_BIN \\"
-echo "      --model-path $SHOW_MODEL_PATH \\"
-echo "      --model-type $SHOW_MODEL_TYPE \\"
-echo "      --port $PORT > $CRANE_LOG 2>&1 &"
-echo ""
-echo "    # Or use the installer:"
-if [ -n "$MODEL_PATH" ]; then
-  echo "    bash install.sh --model-path $MODEL_PATH --model-type $SHOW_MODEL_TYPE --daemon --port $PORT"
-else
-  echo "    bash install.sh --model qwen3-vl-2b --daemon --port $PORT"
-fi
-echo ""
-
-# ── How to manage the daemon ──
-echo -e "${BOLD}  Manage daemon:${RESET}"
-echo ""
-echo "    tail -f $CRANE_LOG        # View logs"
-echo "    kill \$(cat $CRANE_PID_FILE)  # Stop server"
-echo "    curl localhost:$PORT/health     # Health check"
+echo "    crane-ctl start --model-path $SHOW_MODEL_PATH --model-type $SHOW_MODEL_TYPE --port $PORT"
+echo "    crane-ctl status       # PID, memory, health"
+echo "    crane-ctl log          # Tail logs"
+echo "    crane-ctl restart      # Restart with last config"
+echo "    crane-ctl stop         # Stop server"
+echo "    crane-ctl health       # Quick health check"
 echo ""
 
 # ── How to test ──
