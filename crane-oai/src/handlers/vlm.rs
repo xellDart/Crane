@@ -25,17 +25,32 @@ use crate::{make_error, now_epoch, AppState};
 // ─────────────────────────────────────────────────────────────
 
 pub enum VlmRequest {
-    /// Non-streaming request
+    /// Non-streaming PaddleOCR request
     Recognize {
         img_path: std::path::PathBuf,
         task: OcrTask,
         max_tokens: usize,
         tx: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
-    /// Streaming request
+    /// Streaming PaddleOCR request
     RecognizeStream {
         img_path: std::path::PathBuf,
         task: OcrTask,
+        max_tokens: usize,
+        token_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        done_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Non-streaming Qwen3-VL request
+    Qwen3VlRecognize {
+        img_paths: Vec<std::path::PathBuf>,
+        prompt: String,
+        max_tokens: usize,
+        tx: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Streaming Qwen3-VL request
+    Qwen3VlRecognizeStream {
+        img_paths: Vec<std::path::PathBuf>,
+        prompt: String,
         max_tokens: usize,
         token_tx: tokio::sync::mpsc::UnboundedSender<String>,
         done_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -151,34 +166,49 @@ pub async fn vlm_chat_completions(
     if image_urls.is_empty() {
         return Err(make_error(
             StatusCode::BAD_REQUEST,
-            "No image_url found in messages. PaddleOCR-VL requires at least one image.",
+            "No image_url found in messages. VLM requires at least one image.",
         ));
     }
 
-    // Use the first image URL.
-    let image_url = &image_urls[0];
+    // Download all images.
+    let mut temp_dirs = Vec::new();
+    let mut img_paths = Vec::new();
+    for url in &image_urls {
+        let (td, ip) = download_image(url)
+            .await
+            .map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
+        temp_dirs.push(td);
+        img_paths.push(ip);
+    }
 
-    // Download image.
-    let (temp_dir, img_path) = download_image(image_url)
-        .await
-        .map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
-
-    let task = detect_ocr_task(&text_prompt);
     let max_tokens = req.max_tokens;
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let is_qwen3_vl = state.is_qwen3_vl;
 
     if req.stream {
         // Streaming mode
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
-        if vlm_tx.send(VlmRequest::RecognizeStream {
-            img_path,
-            task,
-            max_tokens,
-            token_tx: tx,
-            done_tx,
-        }).is_err() {
+        let send_result = if is_qwen3_vl {
+            vlm_tx.send(VlmRequest::Qwen3VlRecognizeStream {
+                img_paths,
+                prompt: text_prompt.clone(),
+                max_tokens,
+                token_tx: tx,
+                done_tx,
+            })
+        } else {
+            let task = detect_ocr_task(&text_prompt);
+            vlm_tx.send(VlmRequest::RecognizeStream {
+                img_path: img_paths.into_iter().next().unwrap(),
+                task,
+                max_tokens,
+                token_tx: tx,
+                done_tx,
+            })
+        };
+        if send_result.is_err() {
             return Err(make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM engine thread crashed"));
         }
 
@@ -253,12 +283,23 @@ pub async fn vlm_chat_completions(
     } else {
         // Non-streaming mode
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if vlm_tx.send(VlmRequest::Recognize {
-            img_path,
-            task,
-            max_tokens,
-            tx,
-        }).is_err() {
+        let send_result = if is_qwen3_vl {
+            vlm_tx.send(VlmRequest::Qwen3VlRecognize {
+                img_paths,
+                prompt: text_prompt,
+                max_tokens,
+                tx,
+            })
+        } else {
+            let task = detect_ocr_task(&text_prompt);
+            vlm_tx.send(VlmRequest::Recognize {
+                img_path: img_paths.into_iter().next().unwrap(),
+                task,
+                max_tokens,
+                tx,
+            })
+        };
+        if send_result.is_err() {
             return Err(make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM engine thread crashed"));
         }
 

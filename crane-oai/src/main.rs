@@ -100,8 +100,10 @@ pub struct AppState {
     pub eos_token_id: Vec<u32>,
     /// Server start time (epoch seconds).
     pub server_start_time: u64,
-    /// VLM model (PaddleOCR-VL) — present only for VLM model types.
+    /// VLM model — present only for VLM model types.
     pub vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>,
+    /// Whether the loaded VLM is Qwen3-VL (vs PaddleOCR-VL).
+    pub is_qwen3_vl: bool,
     /// TTS model (Qwen3-TTS) — present only for TTS model types.
     pub tts_tx: Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>,
     // ── Fields for /model_info and /server_info ──
@@ -378,8 +380,8 @@ async fn main() -> Result<()> {
 
         (None, tokenizer, vec![eos_id], chat_template, None, Some(tts_tx))
     } else if is_vlm {
-        // VLM path: create PaddleOcrVL on a dedicated thread to avoid Send/Sync issues.
-        info!("Loading VLM model (PaddleOCR-VL) from: {}", args.model_path);
+        // VLM path: create model on a dedicated thread to avoid Send/Sync issues.
+        info!("Loading VLM model ({:?}) from: {}", resolved_type, args.model_path);
 
         let use_cpu = args.cpu || {
             #[cfg(feature = "cuda")]
@@ -394,42 +396,77 @@ async fn main() -> Result<()> {
         let use_bf16 = false;
 
         let model_path_clone = args.model_path.clone();
+        let vlm_type = resolved_type;
         let (vlm_tx, mut vlm_rx) = tokio::sync::mpsc::unbounded_channel::<VlmRequest>();
 
         std::thread::Builder::new()
             .name("vlm-engine".into())
             .spawn(move || {
-                let mut vlm = match engine::model_factory::create_vlm_model(&model_path_clone, use_cpu, use_bf16) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::error!("Failed to load VLM model: {e}");
-                        return;
+                // Load the appropriate VLM model
+                let mut paddle_vlm: Option<crane_core::models::paddleocr_vl::PaddleOcrVL> = None;
+                let mut qwen3_vlm: Option<crane_core::models::qwen3_vl::Qwen3VL> = None;
+
+                match vlm_type {
+                    engine::model_factory::ModelType::Qwen3Vl => {
+                        match engine::model_factory::create_qwen3_vl_model(&model_path_clone, use_cpu, use_bf16) {
+                            Ok(m) => qwen3_vlm = Some(m),
+                            Err(e) => { tracing::error!("Failed to load Qwen3-VL model: {e}"); return; }
+                        }
                     }
-                };
-                info!("VLM engine thread started");
+                    _ => {
+                        match engine::model_factory::create_vlm_model(&model_path_clone, use_cpu, use_bf16) {
+                            Ok(m) => paddle_vlm = Some(m),
+                            Err(e) => { tracing::error!("Failed to load PaddleOCR-VL model: {e}"); return; }
+                        }
+                    }
+                }
+                info!("VLM engine thread started ({:?})", vlm_type);
 
                 while let Some(req) = vlm_rx.blocking_recv() {
                     match req {
                         VlmRequest::Recognize { img_path, task, max_tokens, tx } => {
-                            let res = vlm.recognize(&img_path, task, max_tokens).map(|r| r.text);
-                            if let Err(ref e) = res {
-                                tracing::error!("VLM Recognize failed: {:?}", e);
+                            if let Some(ref mut vlm) = paddle_vlm {
+                                let res = vlm.recognize(&img_path, task, max_tokens).map(|r| r.text);
+                                if let Err(ref e) = res { tracing::error!("VLM Recognize failed: {:?}", e); }
+                                let _ = tx.send(res.map_err(|e| e.to_string()));
+                            } else {
+                                let _ = tx.send(Err("PaddleOCR-VL not loaded".into()));
                             }
-                            let _ = tx.send(res.map_err(|e| e.to_string()));
                         }
                         VlmRequest::RecognizeStream { img_path, task, max_tokens, token_tx, done_tx } => {
-                            let res = vlm.recognize_stream(
-                                &img_path,
-                                task,
-                                max_tokens,
-                                |token_text: &str| {
-                                    let _ = token_tx.send(token_text.to_string());
-                                }
-                            );
-                            if let Err(ref e) = res {
-                                tracing::error!("VLM RecognizeStream failed: {:?}", e);
+                            if let Some(ref mut vlm) = paddle_vlm {
+                                let res = vlm.recognize_stream(
+                                    &img_path, task, max_tokens,
+                                    |token_text: &str| { let _ = token_tx.send(token_text.to_string()); }
+                                );
+                                if let Err(ref e) = res { tracing::error!("VLM RecognizeStream failed: {:?}", e); }
+                                let _ = done_tx.send(res.map(|_| ()).map_err(|e| e.to_string()));
+                            } else {
+                                let _ = done_tx.send(Err("PaddleOCR-VL not loaded".into()));
                             }
-                            let _ = done_tx.send(res.map(|_| ()).map_err(|e| e.to_string()));
+                        }
+                        VlmRequest::Qwen3VlRecognize { img_paths, prompt, max_tokens, tx } => {
+                            if let Some(ref mut vlm) = qwen3_vlm {
+                                let paths: Vec<&std::path::Path> = img_paths.iter().map(|p| p.as_path()).collect();
+                                let res = vlm.recognize_stream(&paths, &prompt, max_tokens, |_| {}).map(|r| r.text);
+                                if let Err(ref e) = res { tracing::error!("Qwen3-VL Recognize failed: {:?}", e); }
+                                let _ = tx.send(res.map_err(|e| e.to_string()));
+                            } else {
+                                let _ = tx.send(Err("Qwen3-VL not loaded".into()));
+                            }
+                        }
+                        VlmRequest::Qwen3VlRecognizeStream { img_paths, prompt, max_tokens, token_tx, done_tx } => {
+                            if let Some(ref mut vlm) = qwen3_vlm {
+                                let paths: Vec<&std::path::Path> = img_paths.iter().map(|p| p.as_path()).collect();
+                                let res = vlm.recognize_stream(
+                                    &paths, &prompt, max_tokens,
+                                    |token_text: &str| { let _ = token_tx.send(token_text.to_string()); }
+                                );
+                                if let Err(ref e) = res { tracing::error!("Qwen3-VL RecognizeStream failed: {:?}", e); }
+                                let _ = done_tx.send(res.map(|_| ()).map_err(|e| e.to_string()));
+                            } else {
+                                let _ = done_tx.send(Err("Qwen3-VL not loaded".into()));
+                            }
                         }
                     }
                 }
@@ -525,6 +562,7 @@ async fn main() -> Result<()> {
         eos_token_id,
         server_start_time: now_epoch(),
         vlm_tx: vlm_tx_opt,
+        is_qwen3_vl: resolved_type == engine::model_factory::ModelType::Qwen3Vl,
         tts_tx: tts_tx_opt,
         model_path: args.model_path.clone(),
         model_type_name: resolved_type.display_name().to_string(),

@@ -7,14 +7,18 @@
 
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, IndexOp, Module, Shape, Tensor, D};
-use candle_nn::{self, Activation, Embedding, LayerNorm, VarBuilder};
-use candle_transformers::models::with_tracing::{linear, linear_no_bias, Linear, RmsNorm};
+use candle_nn::{self, linear, linear_no_bias, Activation, Embedding, LayerNorm, Linear, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
 use super::config::PreprocessorConfig;
+
+fn rms_norm(size: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<RmsNorm> {
+    let w = vb.get_with_hints(size, "weight", candle_nn::Init::Const(1.))?;
+    Ok(RmsNorm::new(w, eps))
+}
 
 // ── Config ───────────────────────────────────────────────────────────
 
@@ -91,7 +95,7 @@ impl VisionPatchEmbed {
         let b = vb.pp("proj").get_with_hints(cfg.hidden_size, "bias", candle_nn::Init::Const(0.))?;
         let in_dim = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
         let w_2d = w.reshape((cfg.hidden_size, in_dim))?;
-        let proj = Linear::from_weights(w_2d, Some(b));
+        let proj = Linear::new(w_2d, Some(b));
         Ok(Self { proj })
     }
 
@@ -217,7 +221,10 @@ impl VisionAttention {
 
         // Scaled dot-product attention
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn = (q.matmul(&k.transpose(1, 2)?)? * scale)?;
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        let attn = (q.matmul(&k.transpose(1, 2)?.contiguous()?)? * scale)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         let out = attn.matmul(&v)?; // (heads, seq, dim)
 
@@ -606,17 +613,21 @@ impl MRoPE {
 // ── Text: Attention (Qwen3 with QK-norm, GQA) ───────────────────────
 
 struct TextAttention {
+    qkv_proj: Option<Linear>,
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
+    q_dim: usize,
+    kv_dim: usize,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
     kv_cache: Option<(Tensor, Tensor)>,
+    cache_seq_len: usize,
 }
 
 impl TextAttention {
@@ -625,18 +636,35 @@ impl TextAttention {
         let nh = cfg.num_attention_heads;
         let nkv = cfg.num_key_value_heads;
         let hd = cfg.head_dim;
+        let q_dim = nh * hd;
+        let kv_dim = nkv * hd;
+
+        let q_proj = linear_no_bias(h, q_dim, vb.pp("q_proj"))?;
+        let k_proj = linear_no_bias(h, kv_dim, vb.pp("k_proj"))?;
+        let v_proj = linear_no_bias(h, kv_dim, vb.pp("v_proj"))?;
+
+        // Fused QKV: merge weights into single matmul
+        let qkv_proj = {
+            let qkv_w = Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?;
+            Some(Linear::new(qkv_w, None))
+        };
+
         Ok(Self {
-            q_proj: linear_no_bias(h, nh * hd, vb.pp("q_proj"))?,
-            k_proj: linear_no_bias(h, nkv * hd, vb.pp("k_proj"))?,
-            v_proj: linear_no_bias(h, nkv * hd, vb.pp("v_proj"))?,
-            o_proj: linear_no_bias(nh * hd, h, vb.pp("o_proj"))?,
-            q_norm: RmsNorm::new(hd, cfg.rms_norm_eps, vb.pp("q_norm"))?,
-            k_norm: RmsNorm::new(hd, cfg.rms_norm_eps, vb.pp("k_norm"))?,
+            qkv_proj,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj: linear_no_bias(q_dim, h, vb.pp("o_proj"))?,
+            q_norm: rms_norm(hd, cfg.rms_norm_eps, vb.pp("q_norm"))?,
+            k_norm: rms_norm(hd, cfg.rms_norm_eps, vb.pp("k_norm"))?,
+            q_dim,
+            kv_dim,
             num_heads: nh,
             num_kv_heads: nkv,
             num_kv_groups: nh / nkv,
             head_dim: hd,
             kv_cache: None,
+            cache_seq_len: 0,
         })
     }
 
@@ -649,10 +677,20 @@ impl TextAttention {
     ) -> candle_core::Result<Tensor> {
         let (b, seq_len, _) = xs.dims3()?;
 
-        // Project Q, K, V
-        let q = self.q_proj.forward(xs)?.reshape((b, seq_len, self.num_heads, self.head_dim))?;
-        let k = self.k_proj.forward(xs)?.reshape((b, seq_len, self.num_kv_heads, self.head_dim))?;
-        let v = self.v_proj.forward(xs)?.reshape((b, seq_len, self.num_kv_heads, self.head_dim))?;
+        // Fused QKV projection: 1 matmul instead of 3
+        let (q, k, v) = if let Some(ref qkv) = self.qkv_proj {
+            let qkv_out = qkv.forward(xs)?;
+            let q = qkv_out.narrow(D::Minus1, 0, self.q_dim)?;
+            let k = qkv_out.narrow(D::Minus1, self.q_dim, self.kv_dim)?;
+            let v = qkv_out.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
+            (q, k, v)
+        } else {
+            (self.q_proj.forward(xs)?, self.k_proj.forward(xs)?, self.v_proj.forward(xs)?)
+        };
+
+        let q = q.reshape((b, seq_len, self.num_heads, self.head_dim))?;
+        let k = k.reshape((b, seq_len, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((b, seq_len, self.num_kv_heads, self.head_dim))?;
 
         // QK-norm (per head)
         let q = self.q_norm.forward(&q)?;
@@ -663,24 +701,72 @@ impl TextAttention {
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
 
-        // Apply M-RoPE: cos/sin are (seq_len, head_dim)
-        let q = self.apply_rope(&q, cos, sin)?;
-        let k = self.apply_rope(&k, cos, sin)?;
+        // Apply M-RoPE
+        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, cos, sin)?;
+        let k = candle_nn::rotary_emb::rope(&k.contiguous()?, cos, sin)?;
+        let v = v.contiguous()?;
 
-        // KV cache
+        // Pre-allocated KV cache with slice_set: O(1) per decode step
         let (k, v) = match &self.kv_cache {
-            None => (k, v),
-            Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?),
+            None => {
+                let (b_k, h_k, s_k, d_k) = k.dims4()?;
+                let room = 256;
+                let buf_k = Tensor::zeros((b_k, h_k, s_k + room, d_k), k.dtype(), k.device())?;
+                let buf_v = Tensor::zeros((b_k, h_k, s_k + room, d_k), v.dtype(), v.device())?;
+                buf_k.slice_set(&k, 2, 0)?;
+                buf_v.slice_set(&v, 2, 0)?;
+                self.kv_cache = Some((buf_k, buf_v));
+                self.cache_seq_len = s_k;
+                (k, v)
+            }
+            Some((buf_k, buf_v)) => {
+                let new_total = self.cache_seq_len + seq_len;
+                let buf_len = buf_k.dim(2)?;
+                if new_total <= buf_len {
+                    buf_k.slice_set(&k, 2, self.cache_seq_len)?;
+                    buf_v.slice_set(&v, 2, self.cache_seq_len)?;
+                } else {
+                    // Rare: need to grow buffer
+                    let (b_k, h_k, _, d_k) = buf_k.dims4()?;
+                    let new_buf_k = Tensor::zeros((b_k, h_k, new_total + 256, d_k), buf_k.dtype(), buf_k.device())?;
+                    let new_buf_v = Tensor::zeros((b_k, h_k, new_total + 256, d_k), buf_v.dtype(), buf_v.device())?;
+                    new_buf_k.slice_set(&buf_k.narrow(2, 0, self.cache_seq_len)?, 2, 0)?;
+                    new_buf_v.slice_set(&buf_v.narrow(2, 0, self.cache_seq_len)?, 2, 0)?;
+                    new_buf_k.slice_set(&k, 2, self.cache_seq_len)?;
+                    new_buf_v.slice_set(&v, 2, self.cache_seq_len)?;
+                    self.kv_cache = Some((new_buf_k, new_buf_v));
+                }
+                let (buf_k, buf_v) = self.kv_cache.as_ref().unwrap();
+                let k_view = buf_k.narrow(2, 0, new_total)?;
+                let v_view = buf_v.narrow(2, 0, new_total)?;
+                self.cache_seq_len = new_total;
+                (k_view, v_view)
+            }
         };
-        self.kv_cache = Some((k.clone(), v.clone()));
 
-        // GQA: expand KV heads
+        // GQA-grouped SDPA for decode (seq_len=1): avoid expanding KV heads
+        if self.num_kv_groups > 1 && seq_len == 1 {
+            let scale = 1.0 / (self.head_dim as f64).sqrt();
+            let q_g = (q.reshape((b, self.num_kv_heads, self.num_kv_groups, self.head_dim))? * scale)?;
+            let k_t = k.transpose(2, 3)?.contiguous()?;
+            let attn = q_g.contiguous()?.matmul(&k_t)?;
+            let attn = match mask {
+                Some(m) => attn.broadcast_add(m)?,
+                None => attn,
+            };
+            let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+            let out = attn.matmul(&v.contiguous()?)?;
+            let out = out
+                .reshape((b, self.num_heads, self.head_dim))?
+                .reshape((b, 1, self.num_heads * self.head_dim))?;
+            return self.o_proj.forward(&out);
+        }
+
+        // Standard path (prefill or num_kv_groups==1)
         let k = candle_transformers::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
         let v = candle_transformers::utils::repeat_kv(v, self.num_kv_groups)?.contiguous()?;
-
-        // Attention
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn = (q.contiguous()?.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let attn = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
         let attn = match mask {
             Some(m) => attn.broadcast_add(m)?,
             None => attn,
@@ -690,39 +776,67 @@ impl TextAttention {
         self.o_proj.forward(&out)
     }
 
-    fn apply_rope(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
-        // x: (b, heads, seq, dim), cos/sin: (seq, dim) — rope handles broadcasting
-        candle_nn::rotary_emb::rope(&x.contiguous()?, cos, sin)
-    }
-
     fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
+        self.cache_seq_len = 0;
     }
 }
 
 // ── Text: MLP (SwiGLU) ──────────────────────────────────────────────
 
 struct TextMLP {
+    gate_up_proj: Option<Linear>,
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
+    intermediate_size: usize,
 }
 
 impl TextMLP {
     fn new(cfg: &TextConfig, vb: VarBuilder) -> candle_core::Result<Self> {
         let h = cfg.hidden_size;
         let i = cfg.intermediate_size;
+        let gate_proj = linear_no_bias(h, i, vb.pp("gate_proj"))?;
+        let up_proj = linear_no_bias(h, i, vb.pp("up_proj"))?;
+
+        // Fused gate+up: merge into single matmul
+        let gate_up_proj = {
+            let gu_w = Tensor::cat(&[gate_proj.weight(), up_proj.weight()], 0)?;
+            Some(Linear::new(gu_w, None))
+        };
+
         Ok(Self {
-            gate_proj: linear_no_bias(h, i, vb.pp("gate_proj"))?,
-            up_proj: linear_no_bias(h, i, vb.pp("up_proj"))?,
+            gate_up_proj,
+            gate_proj,
+            up_proj,
             down_proj: linear_no_bias(i, h, vb.pp("down_proj"))?,
+            intermediate_size: i,
         })
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?.apply(&Activation::Silu)?;
-        let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&(gate * up)?)
+        if let Some(ref gate_up) = self.gate_up_proj {
+            let gu = gate_up.forward(x)?;
+            #[cfg(feature = "cuda")]
+            {
+                if gu.device().is_cuda() {
+                    let activated = crate::fused_ops::fused_silu_mul(
+                        &gu.contiguous()?,
+                        self.intermediate_size,
+                    )?;
+                    return self.down_proj.forward(&activated);
+                }
+            }
+            // CPU fallback
+            let gate = gu.narrow(D::Minus1, 0, self.intermediate_size)?;
+            let up = gu.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
+            let gate = candle_nn::Activation::Silu.forward(&gate)?;
+            self.down_proj.forward(&(gate * up)?)
+        } else {
+            let gate = self.gate_proj.forward(x)?.apply(&Activation::Silu)?;
+            let up = self.up_proj.forward(x)?;
+            self.down_proj.forward(&(gate * up)?)
+        }
     }
 }
 
@@ -740,8 +854,8 @@ impl TextDecoderLayer {
         Ok(Self {
             self_attn: TextAttention::new(cfg, vb.pp("self_attn"))?,
             mlp: TextMLP::new(cfg, vb.pp("mlp"))?,
-            input_ln: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
-            post_attn_ln: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attention_layernorm"))?,
+            input_ln: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
+            post_attn_ln: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attention_layernorm"))?,
         })
     }
 
@@ -812,9 +926,9 @@ impl TextDecoder {
         for i in 0..cfg.num_hidden_layers {
             layers.push(TextDecoderLayer::new(cfg, vb.pp(&format!("layers.{}", i)))?);
         }
-        let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
+        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::from_weights(embed_tokens.embeddings().clone(), None)
+            Linear::new(embed_tokens.embeddings().clone(), None)
         } else {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
@@ -1060,6 +1174,18 @@ impl Qwen3VL {
         ))
     }
 
+    /// GPU-accelerated greedy sampling
+    fn greedy_sample(logits: &Tensor) -> anyhow::Result<u32> {
+        // gpu_argmax only supports BF16; for F32 models use standard argmax
+        #[cfg(feature = "cuda")]
+        {
+            if logits.device().is_cuda() && logits.dtype() == DType::BF16 {
+                return Ok(crate::fused_ops::gpu_argmax(logits)?);
+            }
+        }
+        Ok(logits.flatten_all()?.argmax(D::Minus1)?.to_dtype(DType::U32)?.to_scalar::<u32>()?)
+    }
+
     pub fn recognize_stream<P: AsRef<Path>, F>(
         &mut self,
         image_paths: &[P],
@@ -1100,13 +1226,13 @@ impl Qwen3VL {
             input_embeds, &cos, &sin, 0,
             Some(&ds_ref), Some(&vision_mask),
         )?;
-        let mut next_token = logits.flatten_all()?.argmax(D::Minus1)?.to_dtype(DType::U32)?.to_scalar::<u32>()?;
+        let mut next_token = Self::greedy_sample(&logits)?;
 
         let eos_id = self.tokenizer.token_to_id("<|im_end|>").unwrap_or(151645);
 
         let mut generated = Vec::new();
-        let prefill_len = input_ids.len(); // sequence length for KV cache offset
-        let mut gen_pos_val = next_gen_pos; // M-RoPE position for generated tokens
+        let prefill_len = input_ids.len();
+        let mut gen_pos_val = next_gen_pos;
         let mut text = String::new();
 
         // 8. Autoregressive generation
@@ -1118,15 +1244,14 @@ impl Qwen3VL {
                 text.push_str(&s);
             }
 
-            // For subsequent tokens, M-RoPE degenerates to standard sequential positions
             let gen_pos = Tensor::new(&[gen_pos_val], &self.device)?;
             let gen_pos_3d = Tensor::stack(&[gen_pos.clone(), gen_pos.clone(), gen_pos.clone()], 0)?;
             let (cos_step, sin_step) = self.mrope.forward(&gen_pos_3d)?;
 
-            let kv_offset = prefill_len + step; // KV cache offset (actual sequence position)
+            let kv_offset = prefill_len + step;
             let token_tensor = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
             let logits = self.decoder.forward_ids(&token_tensor, &cos_step, &sin_step, kv_offset)?;
-            next_token = logits.flatten_all()?.argmax(D::Minus1)?.to_dtype(DType::U32)?.to_scalar::<u32>()?;
+            next_token = Self::greedy_sample(&logits)?;
             gen_pos_val += 1;
         }
 

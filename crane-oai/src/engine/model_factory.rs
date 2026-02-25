@@ -23,6 +23,7 @@ pub enum ModelType {
     Qwen25,
     Qwen3,
     Qwen3TTS,
+    Qwen3Vl,
     PaddleOcrVl,
 }
 
@@ -33,6 +34,7 @@ impl ModelType {
             "qwen25" | "qwen2.5" | "qwen2" => Self::Qwen25,
             "qwen3" => Self::Qwen3,
             "qwen3_tts" | "qwen3tts" | "qwen3-tts" | "tts" => Self::Qwen3TTS,
+            "qwen3_vl" | "qwen3vl" | "qwen3-vl" => Self::Qwen3Vl,
             "paddleocr_vl" | "paddleocrv" | "paddleocr" | "paddle_ocr_vl" | "paddleocrvl" => Self::PaddleOcrVl,
             _ => Self::Auto,
         }
@@ -45,13 +47,14 @@ impl ModelType {
             Self::Qwen25 => "qwen25",
             Self::Qwen3 => "qwen3",
             Self::Qwen3TTS => "qwen3_tts",
+            Self::Qwen3Vl => "qwen3_vl",
             Self::PaddleOcrVl => "paddleocr_vl",
         }
     }
 
     /// Whether this model type is a vision-language model.
     pub fn is_vlm(&self) -> bool {
-        matches!(self, Self::PaddleOcrVl)
+        matches!(self, Self::PaddleOcrVl | Self::Qwen3Vl)
     }
 
     /// Whether this model type is a TTS model.
@@ -108,6 +111,7 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                     match mt.to_lowercase().as_str() {
                         "qwen2" | "qwen2.5" => return ModelType::Qwen25,
                         "qwen3" => return ModelType::Qwen3,
+                        "qwen3_vl" | "qwen3vl" => return ModelType::Qwen3Vl,
                         "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
                         m if m.contains("hunyuan") => return ModelType::HunyuanDense,
                         m if m.contains("paddleocr") => return ModelType::PaddleOcrVl,
@@ -124,6 +128,9 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                         }
                         if a.contains("hunyuan") {
                             return ModelType::HunyuanDense;
+                        }
+                        if a.contains("qwen3vlforconditional") || a.contains("qwen3_vl") {
+                            return ModelType::Qwen3Vl;
                         }
                         if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
                             return ModelType::Qwen3TTS;
@@ -146,6 +153,8 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         ModelType::PaddleOcrVl
     } else if path_lower.contains("hunyuan") {
         ModelType::HunyuanDense
+    } else if path_lower.contains("qwen3-vl") || path_lower.contains("qwen3_vl") || path_lower.contains("qwen3vl") {
+        ModelType::Qwen3Vl
     } else if path_lower.contains("qwen3-tts") || path_lower.contains("qwen3_tts") || path_lower.contains("qwen3tts") {
         ModelType::Qwen3TTS
     } else if path_lower.contains("qwen3") {
@@ -195,8 +204,8 @@ pub fn create_backend(
         }
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
         ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(model_path, device, dtype)?)),
-        ModelType::PaddleOcrVl => {
-            anyhow::bail!("PaddleOCR-VL is a VLM model — use create_vlm_model() instead of create_backend()")
+        ModelType::PaddleOcrVl | ModelType::Qwen3Vl => {
+            anyhow::bail!("VLM models — use the VLM worker thread instead of create_backend()")
         }
         ModelType::Qwen3TTS => {
             anyhow::bail!("Qwen3-TTS is a TTS model — use create_tts_model() instead of create_backend()")
@@ -238,6 +247,16 @@ pub fn create_vlm_model(
 ) -> Result<crane_core::models::paddleocr_vl::PaddleOcrVL> {
     tracing::info!("Creating PaddleOCR-VL model from: {}", model_path);
     crane_core::models::paddleocr_vl::PaddleOcrVL::from_local(model_path, use_cpu, use_bf16)
+}
+
+/// Create a Qwen3-VL model for VLM inference.
+pub fn create_qwen3_vl_model(
+    model_path: &str,
+    use_cpu: bool,
+    use_bf16: bool,
+) -> Result<crane_core::models::qwen3_vl::Qwen3VL> {
+    tracing::info!("Creating Qwen3-VL model from: {}", model_path);
+    crane_core::models::qwen3_vl::Qwen3VL::from_local(model_path, use_cpu, use_bf16)
 }
 
 /// Create a Qwen3-TTS model for TTS inference.
