@@ -8,6 +8,7 @@ crane = { path = "../crane" }
 crane-core = { path = "../crane-core" }
 anyhow = "1.0.100"
 image = "0.25.9"
+serde_json = "1"
 
 [[bin]]
 name = "chat_simple"
@@ -48,6 +49,14 @@ path = "src/tts_voice_clone.rs"
 [[bin]]
 name = "hunyuan_simple"
 path = "src/hunyuan_simple.rs"
+
+[[bin]]
+name = "llava_simple"
+path = "src/llava_simple.rs"
+
+[[bin]]
+name = "qwen3_vl_simple"
+path = "src/qwen3_vl_simple.rs"
 
 [features]
 default = []

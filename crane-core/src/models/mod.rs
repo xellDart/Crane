@@ -1,3 +1,4 @@
+pub mod llava_qwen;
 pub mod modules;
 #[cfg(feature = "onnx")]
 pub mod moonshine_asr;
@@ -7,7 +8,7 @@ pub mod qwen25;
 pub mod qwen25_vit;
 pub mod qwen3;
 pub mod qwen3_tts;
-// pub mod qwen3_vl;
+pub mod qwen3_vl;
 pub mod hunyuan_dense;
 
 #[cfg(feature = "onnx")]
