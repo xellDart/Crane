@@ -425,6 +425,9 @@ impl VisionModel {
 
         // Compute 2D rotary embeddings for vision attention
         let (cos, sin) = self.rotary_emb.forward(grid_thw, self.spatial_merge_size, device)?;
+        // Cast vision RoPE cos/sin to match hidden state dtype (needed for BF16)
+        let cos = cos.to_dtype(hidden.dtype())?;
+        let sin = sin.to_dtype(hidden.dtype())?;
 
         // Forward through blocks, extracting DeepStack features
         let mut deepstack_features = Vec::new();
@@ -503,10 +506,12 @@ impl VisionModel {
             let e10 = pos_table.index_select(&Tensor::new(idx_10.as_slice(), device)?, 0)?;
             let e11 = pos_table.index_select(&Tensor::new(idx_11.as_slice(), device)?, 0)?;
 
-            let w00_t = Tensor::new(w_00.as_slice(), device)?.unsqueeze(1)?;
-            let w01_t = Tensor::new(w_01.as_slice(), device)?.unsqueeze(1)?;
-            let w10_t = Tensor::new(w_10.as_slice(), device)?.unsqueeze(1)?;
-            let w11_t = Tensor::new(w_11.as_slice(), device)?.unsqueeze(1)?;
+            // Cast interpolation weights to match pos_table dtype (needed for BF16)
+            let pos_dtype = pos_table.dtype();
+            let w00_t = Tensor::new(w_00.as_slice(), device)?.unsqueeze(1)?.to_dtype(pos_dtype)?;
+            let w01_t = Tensor::new(w_01.as_slice(), device)?.unsqueeze(1)?.to_dtype(pos_dtype)?;
+            let w10_t = Tensor::new(w_10.as_slice(), device)?.unsqueeze(1)?.to_dtype(pos_dtype)?;
+            let w11_t = Tensor::new(w_11.as_slice(), device)?.unsqueeze(1)?.to_dtype(pos_dtype)?;
 
             let pos_embed = (e00.broadcast_mul(&w00_t)?
                 + e01.broadcast_mul(&w01_t)?
@@ -537,10 +542,11 @@ impl VisionModel {
 struct MRoPE {
     inv_freq: Tensor,
     mrope_section: Vec<usize>,
+    dtype: DType,
 }
 
 impl MRoPE {
-    fn new(cfg: &TextConfig, device: &Device) -> candle_core::Result<Self> {
+    fn new(cfg: &TextConfig, device: &Device, dtype: DType) -> candle_core::Result<Self> {
         let dim = cfg.head_dim;
         let theta = cfg.rope_theta;
         let half_dim = dim / 2;
@@ -553,7 +559,7 @@ impl MRoPE {
             .map(|s| s.mrope_section.clone())
             .unwrap_or_else(|| vec![24, 20, 20]);
 
-        Ok(Self { inv_freq, mrope_section })
+        Ok(Self { inv_freq, mrope_section, dtype })
     }
 
     fn forward(&self, position_ids: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
@@ -604,8 +610,8 @@ impl MRoPE {
         }
 
         let output = Tensor::new(output, device)?; // (seq_len, half_dim)
-        let cos = output.cos()?;
-        let sin = output.sin()?;
+        let cos = output.cos()?.to_dtype(self.dtype)?;
+        let sin = output.sin()?.to_dtype(self.dtype)?;
         Ok((cos, sin))
     }
 }
@@ -1075,7 +1081,7 @@ impl Qwen3VL {
         let decoder = TextDecoder::new(&config.text_config, vb.pp("model.language_model"))?;
 
         println!("Initializing M-RoPE...");
-        let mrope = MRoPE::new(&config.text_config, &device)?;
+        let mrope = MRoPE::new(&config.text_config, &device, dtype)?;
 
         println!("Model loaded!");
 

@@ -7,15 +7,16 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage:");
-        eprintln!("  Image mode:   qwen3_vl_simple <model_path> <img1[,img2,...]> [prompt]");
-        eprintln!("  Dataset mode: qwen3_vl_simple <model_path> --entry <index> [--dataset <train.json>]");
+        eprintln!("  Image mode:   qwen3_vl_simple <model_path> <img1[,img2,...]> [prompt] [--bf16]");
+        eprintln!("  Dataset mode: qwen3_vl_simple <model_path> --entry <index> [--dataset <train.json>] [--bf16]");
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  qwen3_vl_simple ./checkpoints/qwen3_vl_2b_merged ./front.jpg \"Extract MRZ\"");
-        eprintln!("  qwen3_vl_simple ./checkpoints/qwen3_vl_2b_merged --entry 0");
+        eprintln!("  qwen3_vl_simple ./checkpoints/qwen3_vl_2b_merged --entry 0 --bf16");
         std::process::exit(1);
     }
 
+    let use_bf16 = args.iter().any(|a| a == "--bf16");
     let model_path = &args[1];
 
     // Dataset mode
@@ -26,7 +27,7 @@ fn main() -> Result<()> {
         } else {
             PathBuf::from("train.json")
         };
-        return run_dataset_entry(model_path, &dataset_path, index);
+        return run_dataset_entry(model_path, &dataset_path, index, use_bf16);
     }
 
     // Image mode: pass user text, model builds prompt internally
@@ -37,8 +38,8 @@ fn main() -> Result<()> {
         "Describe this image in detail.".to_string()
     };
 
-    println!("Loading model from: {}", model_path);
-    let mut model = Qwen3VL::from_local(model_path, false, false)?;
+    println!("Loading model from: {} (bf16={})", model_path, use_bf16);
+    let mut model = Qwen3VL::from_local(model_path, false, use_bf16)?;
 
     println!("Processing {} image(s): {}", image_paths.len(), args[2]);
     println!("User text: {}", user_text);
@@ -64,7 +65,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_dataset_entry(model_path: &str, dataset_path: &Path, index: usize) -> Result<()> {
+fn run_dataset_entry(model_path: &str, dataset_path: &Path, index: usize, use_bf16: bool) -> Result<()> {
     let dataset_dir = dataset_path
         .parent()
         .unwrap_or(Path::new("."))
@@ -122,9 +123,8 @@ fn run_dataset_entry(model_path: &str, dataset_path: &Path, index: usize) -> Res
     println!("Prompt: {}...", &human_text[..human_text.len().min(120)]);
     println!();
 
-    // recognize_stream now takes the raw user text and builds the prompt internally
-    println!("Loading model from: {}", model_path);
-    let mut model = Qwen3VL::from_local(model_path, false, false)?;
+    println!("Loading model from: {} (bf16={})", model_path, use_bf16);
+    let mut model = Qwen3VL::from_local(model_path, false, use_bf16)?;
     println!("---");
     println!("MODEL OUTPUT:");
 
