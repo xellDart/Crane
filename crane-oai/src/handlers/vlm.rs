@@ -64,8 +64,6 @@ pub enum VlmRequest {
 /// Resolve an image URL to a local file path.
 /// Supports:
 ///   - data:image/jpeg;base64,...  → decode base64 to temp file
-///   - file:///absolute/path.jpg   → uses the local file directly
-///   - /absolute/path.jpg          → uses the local file directly
 ///   - http(s)://...               → downloads to temp file
 async fn download_image(url: &str) -> Result<(tempfile::TempDir, std::path::PathBuf), String> {
     use base64::Engine;
@@ -97,30 +95,6 @@ async fn download_image(url: &str) -> Result<(tempfile::TempDir, std::path::Path
         let dest = dir.path().join(format!("image.{ext}"));
         std::fs::write(&dest, &bytes)
             .map_err(|e| format!("Failed to write decoded image: {e}"))?;
-        return Ok((dir, dest));
-    }
-
-    // Handle local file paths (file:// scheme or absolute paths)
-    if url.starts_with("file://") {
-        let local_path = std::path::PathBuf::from(url.strip_prefix("file://").unwrap());
-        if !local_path.exists() {
-            return Err(format!("Local image not found: {}", local_path.display()));
-        }
-        let ext = local_path.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
-        let dest = dir.path().join(format!("image.{ext}"));
-        std::fs::copy(&local_path, &dest)
-            .map_err(|e| format!("Failed to copy local image: {e}"))?;
-        return Ok((dir, dest));
-    }
-    if url.starts_with('/') {
-        let local_path = std::path::PathBuf::from(url);
-        if !local_path.exists() {
-            return Err(format!("Local image not found: {}", local_path.display()));
-        }
-        let ext = local_path.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
-        let dest = dir.path().join(format!("image.{ext}"));
-        std::fs::copy(&local_path, &dest)
-            .map_err(|e| format!("Failed to copy local image: {e}"))?;
         return Ok((dir, dest));
     }
 
