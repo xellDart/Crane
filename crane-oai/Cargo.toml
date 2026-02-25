@@ -28,6 +28,7 @@ hound = "3.5.1"
 
 [features]
 cuda = ["crane-core/cuda"]
+flash-attn = ["cuda", "crane-core/flash-attn"]
 cudnn = ["crane-core/cudnn"]
 mkl = ["crane-core/mkl"]
 

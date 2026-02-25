@@ -16,6 +16,8 @@ ribo = "0.1.3"
 tokenizers = "0.22.2"
 
 [features]
+cuda = ["crane-core/cuda"]
+flash-attn = ["cuda", "crane-core/flash-attn"]
 onnx = ["crane-core/onnx"]
 
 [lib]
