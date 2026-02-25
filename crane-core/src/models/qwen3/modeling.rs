@@ -466,32 +466,15 @@ impl Attention {
             return self.o_proj.forward(&attn_output);
         }
 
-        // ── Standard SDPA for prefill or when n_rep == 1 ──
-        let k = if n_rep > 1 {
-            let (b, kv_heads, s, d) = k.dims4()?;
-            k.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .reshape((b, kv_heads * n_rep, s, d))?
-        } else {
-            k
-        };
-        let v = if n_rep > 1 {
-            let (b, kv_heads, s, d) = v.dims4()?;
-            v.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .reshape((b, kv_heads * n_rep, s, d))?
-        } else {
-            v
-        };
-
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights.broadcast_add(mask)?,
-            None => attn_weights,
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        // ── SDPA for prefill or when n_rep == 1 ──
+        // Flash Attention dispatch (handles GQA natively, no KV head expansion needed)
+        let attn_output = crate::fused_ops::attention::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            attention_mask,
+            seq_len > 1, // causal for prefill
+        )?;
 
         // [B, H, S, D] → [B, S, H*D]
         let attn_output = attn_output
@@ -607,7 +590,8 @@ struct DecoderLayer {
     self_attn: Attention,
     mlp: Mlp,
     input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    post_attn_ln_weight: Tensor,
+    rms_norm_eps: f64,
 }
 
 impl DecoderLayer {
@@ -619,16 +603,15 @@ impl DecoderLayer {
             config.rms_norm_eps,
             vb.pp("input_layernorm"),
         )?;
-        let post_attention_layernorm = candle_nn::rms_norm(
-            config.hidden_size,
-            config.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
-        )?;
+        let post_attn_ln_weight = vb
+            .pp("post_attention_layernorm")
+            .get_with_hints(config.hidden_size, "weight", candle_nn::Init::Const(1.))?;
         Ok(Self {
             self_attn,
             mlp,
             input_layernorm,
-            post_attention_layernorm,
+            post_attn_ln_weight,
+            rms_norm_eps: config.rms_norm_eps,
         })
     }
 
@@ -642,13 +625,14 @@ impl DecoderLayer {
         let prefix = format!("blk.{layer_idx}");
         let input_layernorm =
             gg.rms_norm(&format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;
-        let post_attention_layernorm =
-            gg.rms_norm(&format!("{prefix}.ffn_norm.weight"), config.rms_norm_eps)?;
+        let post_attn_ws = gg.tensor(&format!("{prefix}.ffn_norm.weight"))?;
+        let post_attn_ln_weight = post_attn_ws.dequantize(gg.device())?.to_dtype(gg.dtype())?;
         Ok(Self {
             self_attn,
             mlp,
             input_layernorm,
-            post_attention_layernorm,
+            post_attn_ln_weight,
+            rms_norm_eps: config.rms_norm_eps,
         })
     }
 
@@ -664,12 +648,17 @@ impl DecoderLayer {
         let hidden_states =
             self.self_attn
                 .forward(&hidden_states, cos, sin, attention_mask)?;
-        let hidden_states = (residual + hidden_states)?;
 
-        let residual = &hidden_states;
-        let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
+        // Fused: new_residual = residual + attn_out; normalized = rmsnorm(new_residual)
+        let (new_residual, hidden_states) = crate::fused_ops::fused_add_rmsnorm(
+            residual,
+            &hidden_states,
+            &self.post_attn_ln_weight,
+            self.rms_norm_eps,
+        )?;
+
         let hidden_states = self.mlp.forward(&hidden_states)?;
-        residual + hidden_states
+        &new_residual + hidden_states
     }
 
     fn clear_kv_cache(&mut self) {

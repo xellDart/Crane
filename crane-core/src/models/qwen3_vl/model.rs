@@ -172,10 +172,9 @@ impl VisionRotaryEmbedding {
         let half_rope_dim = 2 * n_freq; // 32
         let freqs = Tensor::from_vec(all_freqs, (total_patches, half_rope_dim), device)?;
 
-        // Double: emb = cat(freqs, freqs) → (total_patches, 64)
-        let emb = Tensor::cat(&[&freqs, &freqs], 1)?;
-        let cos = emb.cos()?;
-        let sin = emb.sin()?;
+        // cos/sin of half-dim freqs (apply_vision_rope uses split-half formula directly)
+        let cos = freqs.cos()?;
+        let sin = freqs.sin()?;
         Ok((cos, sin))
     }
 }
@@ -214,39 +213,36 @@ impl VisionAttention {
         let q = self.apply_vision_rope(&q, cos, sin)?;
         let k = self.apply_vision_rope(&k, cos, sin)?;
 
-        // Transpose for attention: (heads, seq, dim)
-        let q = q.transpose(0, 1)?;
-        let k = k.transpose(0, 1)?;
-        let v = v.transpose(0, 1)?;
-
-        // Scaled dot-product attention
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        // Scaled dot-product attention (Flash Attention dispatch for 3D vision tensors)
+        // q, k, v are (seq, heads, dim) — flash_attn_3d handles the layout
         let q = q.contiguous()?;
         let k = k.contiguous()?;
         let v = v.contiguous()?;
-        let attn = (q.matmul(&k.transpose(1, 2)?.contiguous()?)? * scale)?;
-        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
-        let out = attn.matmul(&v)?; // (heads, seq, dim)
+        let out = crate::fused_ops::attention::scaled_dot_product_attention_3d(&q, &k, &v)?;
 
-        // Reshape back
-        let out = out.transpose(0, 1)?.contiguous()?; // (seq, heads, dim)
+        // Reshape: (seq, heads, dim) -> (seq, hidden)
+        let out = out.contiguous()?;
         let out = out.reshape((seq_len, self.num_heads * self.head_dim))?;
         self.proj.forward(&out)
     }
 
     fn apply_vision_rope(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
-        // x: (seq, heads, dim), cos/sin: (seq, dim)
+        // x: (seq, heads, dim), cos/sin: (seq, half_dim) — already half-dim, no doubling needed.
+        // Split-half formula (avoids cat for rotated tensor):
+        //   out_lo = x_lo * cos - x_hi * sin
+        //   out_hi = x_lo * sin + x_hi * cos
         let (_seq, _heads, dim) = x.dims3()?;
         let half = dim / 2;
 
-        let cos = cos.unsqueeze(1)?; // (seq, 1, dim)
+        let cos = cos.unsqueeze(1)?; // (seq, 1, half)
         let sin = sin.unsqueeze(1)?;
 
         let x1 = x.narrow(2, 0, half)?;
         let x2 = x.narrow(2, half, half)?;
-        let rotated = Tensor::cat(&[&(x2.neg())?, &x1], 2)?;
-        let result = (x.broadcast_mul(&cos)? + rotated.broadcast_mul(&sin)?)?;
-        Ok(result)
+
+        let out_lo = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
+        let out_hi = (x1.broadcast_mul(&sin)? + x2.broadcast_mul(&cos)?)?;
+        Tensor::cat(&[&out_lo, &out_hi], 2)
     }
 }
 
@@ -769,16 +765,15 @@ impl TextAttention {
         }
 
         // Standard path (prefill or num_kv_groups==1)
-        let k = candle_transformers::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = candle_transformers::utils::repeat_kv(v, self.num_kv_groups)?.contiguous()?;
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
-        let attn = match mask {
-            Some(m) => attn.broadcast_add(m)?,
-            None => attn,
-        };
-        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
-        let out = attn.matmul(&v)?.transpose(1, 2)?.reshape((b, seq_len, self.num_heads * self.head_dim))?;
+        // Flash Attention dispatch (handles GQA natively, no KV head expansion needed)
+        let attn_output = crate::fused_ops::attention::scaled_dot_product_attention(
+            &q.contiguous()?,
+            &k,
+            &v,
+            mask,
+            seq_len > 1, // causal for prefill
+        )?;
+        let out = attn_output.transpose(1, 2)?.contiguous()?.reshape((b, seq_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out)
     }
 
@@ -852,16 +847,21 @@ struct TextDecoderLayer {
     self_attn: TextAttention,
     mlp: TextMLP,
     input_ln: RmsNorm,
-    post_attn_ln: RmsNorm,
+    post_attn_ln_weight: Tensor,
+    rms_norm_eps: f64,
 }
 
 impl TextDecoderLayer {
     fn new(cfg: &TextConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        let post_attn_ln_weight = vb
+            .pp("post_attention_layernorm")
+            .get_with_hints(cfg.hidden_size, "weight", candle_nn::Init::Const(1.))?;
         Ok(Self {
             self_attn: TextAttention::new(cfg, vb.pp("self_attn"))?,
             mlp: TextMLP::new(cfg, vb.pp("mlp"))?,
             input_ln: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
-            post_attn_ln: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attention_layernorm"))?,
+            post_attn_ln_weight,
+            rms_norm_eps: cfg.rms_norm_eps,
         })
     }
 
@@ -875,11 +875,17 @@ impl TextDecoderLayer {
         let residual = xs;
         let xs = self.input_ln.forward(xs)?;
         let xs = self.self_attn.forward(&xs, cos, sin, mask)?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let h = self.post_attn_ln.forward(&xs)?;
+
+        // Fused: new_residual = residual + attn_out; normalized = rmsnorm(new_residual)
+        let (new_residual, h) = crate::fused_ops::fused_add_rmsnorm(
+            residual,
+            &xs,
+            &self.post_attn_ln_weight,
+            self.rms_norm_eps,
+        )?;
+
         let h = self.mlp.forward(&h)?;
-        residual + h
+        &new_residual + h
     }
 
     fn clear_kv_cache(&mut self) {
@@ -898,17 +904,46 @@ fn scatter_vision_features(
     device: &Device,
 ) -> candle_core::Result<Tensor> {
     // vis_feat: (vis_tokens, hidden), mask_vec: bool-like per position
-    // Returns (1, seq_len, hidden) with vis_feat placed at mask positions
-    let mut result = Tensor::zeros((1, seq_len, hidden_size), dtype, device)?;
-    let mut vis_idx = 0;
+    // Returns (1, seq_len, hidden) with vis_feat placed at mask positions.
+    // Optimized: detect contiguous ranges and batch-assign (typically 1-2 ranges for 1-2 images).
     let num_vis = vis_feat.dim(0)?;
-    for (pos, &m) in mask_vec.iter().enumerate() {
-        if m > 0.5 && vis_idx < num_vis {
-            let feat = vis_feat.i(vis_idx)?.unsqueeze(0)?.unsqueeze(0)?;
-            result = result.slice_assign(&[0..1, pos..pos + 1, 0..hidden_size], &feat)?;
-            vis_idx += 1;
+    let positions: Vec<usize> = mask_vec.iter()
+        .enumerate()
+        .filter(|(_, &m)| m > 0.5)
+        .map(|(i, _)| i)
+        .take(num_vis)
+        .collect();
+
+    if positions.is_empty() {
+        return Tensor::zeros((1, seq_len, hidden_size), dtype, device);
+    }
+
+    let mut result = Tensor::zeros((1, seq_len, hidden_size), dtype, device)?;
+    let mut vis_offset = 0;
+    let mut range_start = positions[0];
+    let mut range_len = 1;
+
+    for i in 1..positions.len() {
+        if positions[i] == positions[i - 1] + 1 {
+            range_len += 1;
+        } else {
+            // Flush current contiguous range as single block
+            let block = vis_feat.narrow(0, vis_offset, range_len)?.unsqueeze(0)?;
+            result = result.slice_assign(
+                &[0..1, range_start..range_start + range_len, 0..hidden_size],
+                &block,
+            )?;
+            vis_offset += range_len;
+            range_start = positions[i];
+            range_len = 1;
         }
     }
+    // Flush last range
+    let block = vis_feat.narrow(0, vis_offset, range_len)?.unsqueeze(0)?;
+    result = result.slice_assign(
+        &[0..1, range_start..range_start + range_len, 0..hidden_size],
+        &block,
+    )?;
     Ok(result)
 }
 
@@ -1057,6 +1092,9 @@ pub struct Qwen3VL {
     preproc_cfg: PreprocessorConfig,
     pub device: Device,
     dtype: DType,
+    /// Cached normalization tensors (created once, reused for all images)
+    img_mean: Tensor,
+    img_std: Tensor,
 }
 
 pub struct Qwen3VLResult {
@@ -1097,9 +1135,19 @@ impl Qwen3VL {
         println!("Initializing M-RoPE...");
         let mrope = MRoPE::new(&config.text_config, &device, dtype)?;
 
+        // Pre-compute normalization tensors on device (reused for all images)
+        let img_mean = Tensor::new(
+            &[preproc_cfg.image_mean[0] as f32, preproc_cfg.image_mean[1] as f32, preproc_cfg.image_mean[2] as f32],
+            &device,
+        )?.reshape((3, 1, 1))?;
+        let img_std = Tensor::new(
+            &[preproc_cfg.image_std[0] as f32, preproc_cfg.image_std[1] as f32, preproc_cfg.image_std[2] as f32],
+            &device,
+        )?.reshape((3, 1, 1))?;
+
         println!("Model loaded!");
 
-        Ok(Self { vision, decoder, mrope, tokenizer, config, preproc_cfg, device, dtype })
+        Ok(Self { vision, decoder, mrope, tokenizer, config, preproc_cfg, device, dtype, img_mean, img_std })
     }
 
     fn compute_mrope_positions(
@@ -1287,42 +1335,59 @@ impl Qwen3VL {
         input_ids: &[u32],
         image_embeds: &Tensor,
     ) -> candle_core::Result<(Tensor, Tensor)> {
+        // Optimized: batch contiguous vision tokens into single narrow() calls
+        // instead of per-token i(idx) + unsqueeze. For 500+ vision tokens per image,
+        // this reduces tensor ops from O(N) to O(num_images).
         let image_token = self.config.image_token_id;
+        let num_vis_tokens = image_embeds.dim(0)?;
         let mut parts: Vec<Tensor> = Vec::new();
         let mut mask_vals: Vec<f32> = Vec::new();
         let mut vis_idx = 0;
-        let num_vis_tokens = image_embeds.dim(0)?;
-
         let mut current_text: Vec<u32> = Vec::new();
+        let mut vis_run_start: Option<usize> = None;
+        let mut vis_run_len = 0usize;
+
+        let flush_text = |text: &mut Vec<u32>, parts: &mut Vec<Tensor>, mask: &mut Vec<f32>, device: &Device, decoder: &TextDecoder| -> candle_core::Result<()> {
+            if !text.is_empty() {
+                let ids = Tensor::new(text.as_slice(), device)?;
+                let emb = decoder.embed(&ids)?;
+                mask.extend(std::iter::repeat(0.0f32).take(text.len()));
+                parts.push(emb);
+                text.clear();
+            }
+            Ok(())
+        };
 
         for &id in input_ids {
-            if id == image_token {
-                // Flush text
-                if !current_text.is_empty() {
-                    let ids = Tensor::new(current_text.as_slice(), &self.device)?;
-                    let emb = self.decoder.embed(&ids)?;
-                    for _ in 0..current_text.len() { mask_vals.push(0.0); }
-                    parts.push(emb);
-                    current_text.clear();
+            if id == image_token && vis_idx < num_vis_tokens {
+                // Flush any pending text first
+                flush_text(&mut current_text, &mut parts, &mut mask_vals, &self.device, &self.decoder)?;
+                // Track contiguous vision token run
+                if vis_run_start.is_none() {
+                    vis_run_start = Some(vis_idx);
+                    vis_run_len = 0;
                 }
-                // Insert one vision token
-                if vis_idx < num_vis_tokens {
-                    let feat = image_embeds.i(vis_idx)?.unsqueeze(0)?;
-                    parts.push(feat);
-                    mask_vals.push(1.0);
-                    vis_idx += 1;
-                }
+                vis_run_len += 1;
+                vis_idx += 1;
             } else {
+                // Flush any pending vision token run
+                if let Some(start) = vis_run_start.take() {
+                    let block = image_embeds.narrow(0, start, vis_run_len)?;
+                    parts.push(block);
+                    mask_vals.extend(std::iter::repeat(1.0f32).take(vis_run_len));
+                    vis_run_len = 0;
+                }
                 current_text.push(id);
             }
         }
-        // Flush remaining text
-        if !current_text.is_empty() {
-            let ids = Tensor::new(current_text.as_slice(), &self.device)?;
-            let emb = self.decoder.embed(&ids)?;
-            for _ in 0..current_text.len() { mask_vals.push(0.0); }
-            parts.push(emb);
+        // Flush remaining vision run
+        if let Some(start) = vis_run_start.take() {
+            let block = image_embeds.narrow(0, start, vis_run_len)?;
+            parts.push(block);
+            mask_vals.extend(std::iter::repeat(1.0f32).take(vis_run_len));
         }
+        // Flush remaining text
+        flush_text(&mut current_text, &mut parts, &mut mask_vals, &self.device, &self.decoder)?;
 
         let combined = Tensor::cat(&parts, 0)?.unsqueeze(0)?;
         let mask = Tensor::new(mask_vals, &self.device)?;
@@ -1340,9 +1405,6 @@ impl Qwen3VL {
         let min_pixels = self.preproc_cfg.size.shortest_edge;
         let max_pixels = self.preproc_cfg.size.longest_edge;
 
-        let img_mean = &self.preproc_cfg.image_mean;
-        let img_std = &self.preproc_cfg.image_std;
-
         let mut all_pixels = Vec::new();
         let mut all_grid_thw = Vec::new();
 
@@ -1357,17 +1419,14 @@ impl Qwen3VL {
             )?;
             let img = image::imageops::resize(&img, rw as u32, rh as u32, image::imageops::FilterType::CatmullRom);
 
-            // Normalize to tensor
-            let mut data = vec![0f32; 3 * rh * rw];
-            for c in 0..3 {
-                for y in 0..rh {
-                    for x in 0..rw {
-                        let pixel = img.get_pixel(x as u32, y as u32)[c] as f32 / 255.0;
-                        data[c * rh * rw + y * rw + x] = (pixel - img_mean[c]) / img_std[c];
-                    }
-                }
-            }
-            let tensor = Tensor::from_vec(data, (1, 3, rh, rw), &self.device)?.to_dtype(self.dtype)?;
+            // GPU-accelerated normalization with cached mean/std tensors
+            let raw: Vec<u8> = img.into_raw();
+            let raw_tensor = Tensor::from_vec(raw, (rh, rw, 3), &Device::Cpu)?
+                .permute((2, 0, 1))?
+                .to_device(&self.device)?;
+            let raw_f32 = (raw_tensor.to_dtype(DType::F32)? * (1.0 / 255.0))?;
+            let tensor = raw_f32.broadcast_sub(&self.img_mean)?.broadcast_div(&self.img_std)?
+                .unsqueeze(0)?.to_dtype(self.dtype)?;
 
             // Duplicate for temporal dim (images → 2 frames)
             let tensor = Tensor::cat(&[&tensor, &tensor], 0)?; // (2, 3, rh, rw)

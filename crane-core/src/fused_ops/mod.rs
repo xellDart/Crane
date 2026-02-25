@@ -11,6 +11,8 @@
 //! Each operation eliminates multiple kernel launches and intermediate
 //! GMEM round-trips compared to the equivalent candle op chain.
 
+pub mod attention;
+
 #[cfg(feature = "cuda")]
 mod cuda_impl;
 
@@ -62,6 +64,18 @@ mod fallback {
 
     pub fn copy_from_tensor_f32(src: &Tensor) -> Result<Tensor> {
         src.contiguous()
+    }
+
+    pub fn fused_add_rmsnorm(
+        residual: &Tensor,
+        hidden: &Tensor,
+        weight: &Tensor,
+        eps: f64,
+    ) -> Result<(Tensor, Tensor)> {
+        let sum = (residual + hidden)?;
+        let norm = candle_nn::RmsNorm::new(weight.clone(), eps);
+        let normalized = candle_core::Module::forward(&norm, &sum)?;
+        Ok((sum, normalized))
     }
 }
 

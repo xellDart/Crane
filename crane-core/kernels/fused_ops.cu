@@ -232,6 +232,67 @@ extern "C" __global__ void fused_add_rmsnorm_bf16(
 }
 
 // =====================================================================
+// 3b. Fused residual_add + RMSNorm (out-of-place variant)
+//
+//     sum_out[row] = residual[row] + hidden[row]
+//     norm_out[row] = rmsnorm(sum_out[row]) * weight
+//
+//     Non-mutating: reads residual, writes to separate sum_out buffer.
+//     Eliminates separate add kernel + RMSNorm kernel + extra memory read.
+// =====================================================================
+
+extern "C" __global__ void fused_add_rmsnorm_out_bf16(
+    const __nv_bfloat16 *__restrict__ residual,  // [rows, cols] — read only
+    const __nv_bfloat16 *__restrict__ hidden,    // [rows, cols] — read only
+    __nv_bfloat16       *__restrict__ sum_out,   // [rows, cols] — residual + hidden
+    __nv_bfloat16       *__restrict__ norm_out,  // [rows, cols] — normalized output
+    const __nv_bfloat16 *__restrict__ weight,    // [cols]
+    const int ncols,
+    const float eps
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    const int row_offset = row * ncols;
+
+    // Phase 1: compute sum, write sum_out, accumulate sum of squares
+    float sum_sq = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        float r = __bfloat162float(residual[row_offset + col]);
+        float h = __bfloat162float(hidden[row_offset + col]);
+        float v = r + h;
+        sum_out[row_offset + col] = __float2bfloat16(v);
+        sum_sq += v * v;
+    }
+
+    // Warp + cross-warp reduce
+    sum_sq = warp_reduce_sum_f32(sum_sq);
+    __shared__ float s_partial[32];
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    int num_warps = block_size / WARP_SIZE;
+
+    if (lane_id == 0) s_partial[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        sum_sq = (lane_id < num_warps) ? s_partial[lane_id] : 0.0f;
+        sum_sq = warp_reduce_sum_f32(sum_sq);
+        if (lane_id == 0) s_partial[0] = sum_sq;
+    }
+    __syncthreads();
+
+    float scale = rsqrtf(s_partial[0] / (float)ncols + eps);
+
+    // Phase 2: normalize from sum_out (same addresses, L1-hot)
+    for (int col = tid; col < ncols; col += block_size) {
+        float v = __bfloat162float(sum_out[row_offset + col]);
+        float w = __bfloat162float(weight[col]);
+        norm_out[row_offset + col] = __float2bfloat16(v * scale * w);
+    }
+}
+
+// =====================================================================
 // 4. GPU Argmax — two-phase reduction for vocab-size vectors
 //
 //    Phase 1: Each block reduces a chunk of rows → per-block max + argmax
