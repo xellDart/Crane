@@ -58,6 +58,10 @@ path = "src/llava_simple.rs"
 name = "qwen3_vl_simple"
 path = "src/qwen3_vl_simple.rs"
 
+[[bin]]
+name = "embedding_simple"
+path = "src/embedding_simple.rs"
+
 [features]
 default = []
 onnx = ["crane/onnx"]

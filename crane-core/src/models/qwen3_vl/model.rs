@@ -350,7 +350,7 @@ impl VisionPatchMerger {
 
 // ── Vision Model ─────────────────────────────────────────────────────
 
-struct VisionModel {
+pub struct VisionModel {
     patch_embed: VisionPatchEmbed,
     pos_embed: Embedding,
     num_grid_per_side: usize,
@@ -363,8 +363,8 @@ struct VisionModel {
 }
 
 impl VisionModel {
-    fn new(vb: VarBuilder, cfg: &VisionConfig) -> candle_core::Result<Self> {
-        let vb = vb.pp("model.visual");
+    /// Create a new VisionModel. `vb` must already be prefixed (e.g. `vb.pp("model.visual")` or `vb.pp("visual")`).
+    pub fn new(vb: VarBuilder, cfg: &VisionConfig) -> candle_core::Result<Self> {
         let patch_embed = VisionPatchEmbed::new(vb.pp("patch_embed"), cfg)?;
         let pos_embed = candle_nn::embedding(
             cfg.num_position_embeddings, cfg.hidden_size, vb.pp("pos_embed"),
@@ -405,7 +405,7 @@ impl VisionModel {
         })
     }
 
-    fn forward(
+    pub fn forward(
         &self,
         pixel_values: &Tensor,
         grid_thw: &Tensor,
@@ -535,14 +535,14 @@ impl VisionModel {
 
 // ── M-RoPE (Multimodal Rotary Position Embeddings) ───────────────────
 
-struct MRoPE {
+pub struct MRoPE {
     inv_freq: Tensor,
     mrope_section: Vec<usize>,
     dtype: DType,
 }
 
 impl MRoPE {
-    fn new(cfg: &TextConfig, device: &Device, dtype: DType) -> candle_core::Result<Self> {
+    pub fn new(cfg: &TextConfig, device: &Device, dtype: DType) -> candle_core::Result<Self> {
         let dim = cfg.head_dim;
         let theta = cfg.rope_theta;
         let half_dim = dim / 2;
@@ -558,7 +558,7 @@ impl MRoPE {
         Ok(Self { inv_freq, mrope_section, dtype })
     }
 
-    fn forward(&self, position_ids: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
+    pub fn forward(&self, position_ids: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
         // position_ids: (3, seq_len) — [temporal, height, width]
         let device = self.inv_freq.device();
         let half_dim = self.inv_freq.dims()[0]; // 64
@@ -949,19 +949,19 @@ fn scatter_vision_features(
 
 // ── Text: Decoder ────────────────────────────────────────────────────
 
-struct TextDecoder {
+pub struct TextDecoder {
     embed_tokens: Embedding,
     layers: Vec<TextDecoderLayer>,
     norm: RmsNorm,
-    lm_head: Linear,
+    lm_head: Option<Linear>,
     device: Device,
     dtype: DType,
     hidden_size: usize,
 }
 
 impl TextDecoder {
-    fn new(cfg: &TextConfig, vb: VarBuilder) -> candle_core::Result<Self> {
-        // vb is already prefixed with "model.language_model"
+    /// Create a new TextDecoder. Set `load_lm_head` to false for embedding-only mode (saves ~1.5GB VRAM).
+    pub fn new(cfg: &TextConfig, vb: VarBuilder, load_lm_head: bool) -> candle_core::Result<Self> {
         let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
@@ -972,17 +972,21 @@ impl TextDecoder {
         // Keep lm_head in F32 for BF16 models: cuBLAS computes BF16 matmul with F32
         // accumulation but casts output back to BF16, which can flip argmax at the EOS
         // boundary. F32 lm_head preserves full accumulation precision → correct token selection.
-        let is_bf16 = vb.dtype() == DType::BF16;
-        let lm_head = if cfg.tie_word_embeddings {
-            let w = embed_tokens.embeddings().clone();
-            Linear::new(if is_bf16 { w.to_dtype(DType::F32)? } else { w }, None)
-        } else {
-            let raw = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
-            if is_bf16 {
-                Linear::new(raw.weight().to_dtype(DType::F32)?, None)
+        let lm_head = if load_lm_head {
+            let is_bf16 = vb.dtype() == DType::BF16;
+            Some(if cfg.tie_word_embeddings {
+                let w = embed_tokens.embeddings().clone();
+                Linear::new(if is_bf16 { w.to_dtype(DType::F32)? } else { w }, None)
             } else {
-                raw
-            }
+                let raw = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+                if is_bf16 {
+                    Linear::new(raw.weight().to_dtype(DType::F32)?, None)
+                } else {
+                    raw
+                }
+            })
+        } else {
+            None
         };
         Ok(Self {
             embed_tokens,
@@ -995,7 +999,7 @@ impl TextDecoder {
         })
     }
 
-    fn embed(&self, ids: &Tensor) -> candle_core::Result<Tensor> {
+    pub fn embed(&self, ids: &Tensor) -> candle_core::Result<Tensor> {
         self.embed_tokens.forward(ids)
     }
 
@@ -1059,8 +1063,53 @@ impl TextDecoder {
         let h = self.norm.forward(&h)?;
         let h = h.narrow(1, seq_len - 1, 1)?;
         // Cast to F32 for lm_head when BF16 (lm_head weights stored in F32 for precision)
+        let lm_head = self.lm_head.as_ref().expect("lm_head required for generation");
         let h = if self.dtype == DType::BF16 { h.to_dtype(DType::F32)? } else { h };
-        h.apply(&self.lm_head)
+        h.apply(lm_head)
+    }
+
+    /// Forward pass that returns ALL hidden states after norm (no lm_head, no token narrowing).
+    /// Used by embedding models (e.g. ColQwen3) that need multi-vector representations.
+    pub fn forward_hidden(
+        &mut self,
+        xs: Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        deepstack_features: Option<&[Tensor]>,
+        vision_mask: Option<&Tensor>,
+    ) -> candle_core::Result<Tensor> {
+        let (_b, seq_len, _) = xs.dims3()?;
+        let mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(self.causal_mask(seq_len, 0)?)
+        };
+
+        let scattered_ds = if let (Some(ds), Some(vm)) = (deepstack_features, vision_mask) {
+            let mask_vec = vm.to_vec1::<f32>()?;
+            let mut scattered = Vec::new();
+            for feat in ds.iter() {
+                let padded = scatter_vision_features(
+                    feat, &mask_vec, seq_len, self.hidden_size, self.dtype, &self.device,
+                )?;
+                scattered.push(padded);
+            }
+            Some(scattered)
+        } else {
+            None
+        };
+
+        let mut h = xs;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            h = layer.forward(&h, cos, sin, mask.as_ref())?;
+            if let Some(ref scattered) = scattered_ds {
+                if i < scattered.len() {
+                    h = (h + &scattered[i])?;
+                }
+            }
+        }
+
+        self.norm.forward(&h)
     }
 
     fn forward_ids(
@@ -1074,7 +1123,7 @@ impl TextDecoder {
         self.forward_embeds(embeds, cos, sin, offset, None, None)
     }
 
-    fn clear_kv_cache(&mut self) {
+    pub fn clear_kv_cache(&mut self) {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
@@ -1127,10 +1176,10 @@ impl Qwen3VL {
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&refs, dtype, &device)? };
 
         println!("Loading vision encoder...");
-        let vision = VisionModel::new(vb.clone(), &config.vision_config)?;
+        let vision = VisionModel::new(vb.pp("model.visual"), &config.vision_config)?;
 
         println!("Loading text decoder...");
-        let decoder = TextDecoder::new(&config.text_config, vb.pp("model.language_model"))?;
+        let decoder = TextDecoder::new(&config.text_config, vb.pp("model.language_model"), true)?;
 
         println!("Initializing M-RoPE...");
         let mrope = MRoPE::new(&config.text_config, &device, dtype)?;

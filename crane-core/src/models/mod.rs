@@ -1,3 +1,4 @@
+pub mod colqwen3_emb;
 pub mod llava_qwen;
 pub mod modules;
 #[cfg(feature = "onnx")]

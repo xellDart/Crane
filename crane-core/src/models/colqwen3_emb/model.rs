@@ -1,0 +1,491 @@
+//! ColQwen3 Embedding Model: multi-vector document/query embedder built on Qwen3-VL.
+//!
+//! Architecture: Qwen3-VL backbone (vision encoder + text decoder) + projection + L2 norm.
+//! Produces per-token embeddings for ColBERT-style late interaction scoring (MaxSim).
+//!
+//! Reference: OpenSearch-AI/Ops-Colqwen3-4B
+
+use anyhow::{Error as E, Result};
+use candle_core::{DType, Device, IndexOp, Module, Shape, Tensor, D};
+use candle_nn::{linear, Linear, VarBuilder};
+use serde::Deserialize;
+use std::path::Path;
+use tokenizers::Tokenizer;
+
+use super::super::qwen3_vl::{
+    MRoPE, Qwen3VLConfig, TextConfig, TextDecoder, VisionConfig, VisionModel,
+};
+use super::super::qwen3_vl::config::PreprocessorConfig;
+
+// ── Config ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ColQwen3Config {
+    pub vision_config: VisionConfig,
+    pub text_config: TextConfig,
+    pub image_token_id: u32,
+    pub video_token_id: u32,
+    pub vision_start_token_id: u32,
+    pub vision_end_token_id: u32,
+    #[serde(default = "default_dims")]
+    pub dims: usize,
+    #[serde(default)]
+    pub mask_non_image_embeddings: bool,
+}
+
+fn default_dims() -> usize { 2560 }
+
+impl ColQwen3Config {
+    /// Convert to Qwen3VLConfig for reusing the backbone components.
+    pub fn as_qwen3vl_config(&self) -> Qwen3VLConfig {
+        Qwen3VLConfig {
+            vision_config: self.vision_config.clone(),
+            text_config: self.text_config.clone(),
+            image_token_id: self.image_token_id,
+            video_token_id: self.video_token_id,
+            vision_start_token_id: self.vision_start_token_id,
+            vision_end_token_id: self.vision_end_token_id,
+        }
+    }
+}
+
+// ── Model ────────────────────────────────────────────────────────────
+
+pub struct ColQwen3Emb {
+    vision: VisionModel,
+    decoder: TextDecoder,
+    mrope: MRoPE,
+    custom_text_proj: Linear,
+    tokenizer: Tokenizer,
+    config: ColQwen3Config,
+    preproc_cfg: PreprocessorConfig,
+    dims: usize,
+    pub device: Device,
+    dtype: DType,
+    img_mean: Tensor,
+    img_std: Tensor,
+}
+
+/// Query processing constants (matching Python OpsColQwen3Processor).
+const QUERY_PREFIX: &str = "Query: ";
+const QUERY_AUGMENTATION_TOKEN: &str = "<|endoftext|>";
+const QUERY_AUGMENTATION_COUNT: usize = 10;
+
+impl ColQwen3Emb {
+    pub fn from_local(path: impl AsRef<Path>, cpu: bool, bf16: bool) -> Result<Self> {
+        let device = if cpu { Device::Cpu } else { Device::cuda_if_available(0)? };
+        let dtype = if bf16 && device.is_cuda() { DType::BF16 } else { DType::F32 };
+
+        let base = path.as_ref();
+        let config: ColQwen3Config =
+            serde_json::from_str(&std::fs::read_to_string(base.join("config.json"))?)?;
+        let preproc_cfg: PreprocessorConfig =
+            serde_json::from_str(&std::fs::read_to_string(base.join("preprocessor_config.json"))?)?;
+        let tokenizer = Tokenizer::from_file(base.join("tokenizer.json")).map_err(E::msg)?;
+
+        let safetensors: Vec<std::path::PathBuf> = std::fs::read_dir(base)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "safetensors"))
+            .collect();
+        if safetensors.is_empty() {
+            anyhow::bail!("No safetensors files found in {}", base.display());
+        }
+        let refs: Vec<&std::path::Path> = safetensors.iter().map(|p| p.as_path()).collect();
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&refs, dtype, &device)? };
+
+        // ColQwen3 BF16 weight prefixes: visual.*, language_model.*, custom_text_proj.*
+        println!("Loading vision encoder...");
+        let vision = VisionModel::new(vb.pp("visual"), &config.vision_config)?;
+
+        println!("Loading text decoder (embedding mode, no lm_head)...");
+        let decoder = TextDecoder::new(&config.text_config, vb.pp("language_model"), false)?;
+
+        println!("Loading projection layer...");
+        let custom_text_proj = linear(
+            config.text_config.hidden_size,
+            config.dims,
+            vb.pp("custom_text_proj"),
+        )?;
+
+        println!("Initializing M-RoPE...");
+        let mrope = MRoPE::new(&config.text_config, &device, dtype)?;
+
+        let img_mean = Tensor::new(
+            &[preproc_cfg.image_mean[0] as f32, preproc_cfg.image_mean[1] as f32, preproc_cfg.image_mean[2] as f32],
+            &device,
+        )?.reshape((3, 1, 1))?;
+        let img_std = Tensor::new(
+            &[preproc_cfg.image_std[0] as f32, preproc_cfg.image_std[1] as f32, preproc_cfg.image_std[2] as f32],
+            &device,
+        )?.reshape((3, 1, 1))?;
+
+        let dims = config.dims;
+        println!("ColQwen3 embedding model loaded! dims={}", dims);
+
+        Ok(Self { vision, decoder, mrope, custom_text_proj, tokenizer, config, preproc_cfg, dims, device, dtype, img_mean, img_std })
+    }
+
+    /// Encode a batch of images into multi-vector embeddings.
+    /// Returns one tensor per image, each of shape (num_tokens, dims).
+    pub fn encode_images<P: AsRef<Path>>(&mut self, image_paths: &[P]) -> Result<Vec<Tensor>> {
+        let (pixel_values, grid_thw) = self.preprocess_images(image_paths)?;
+
+        // Vision encoder
+        let (image_embeds, deepstack_features) = self.vision.forward(&pixel_values, &grid_thw)?;
+
+        // Build visual prompt for each image
+        let grid_thw_vec = grid_thw.to_vec2::<u32>()?;
+        let merge = self.config.vision_config.spatial_merge_size as u32;
+
+        let mut all_embeddings = Vec::new();
+        let mut vis_offset = 0usize;
+
+        for grid in &grid_thw_vec {
+            let t = grid[0];
+            let h = grid[1] / merge;
+            let w = grid[2] / merge;
+            let n_vis_tokens = (t * h * w) as usize;
+
+            // Extract this image's vision embeddings
+            let img_embeds = image_embeds.narrow(0, vis_offset, n_vis_tokens)?;
+
+            // Build prompt tokens for this image
+            let prompt = self.build_visual_prompt(n_vis_tokens);
+            let input_ids = self.tokenizer.encode(prompt.as_str(), false)
+                .map_err(|e| E::msg(format!("Tokenizer: {}", e)))?
+                .get_ids().to_vec();
+
+            // Merge text+vision embeddings
+            let (input_embeds, vision_mask) = self.merge_embeddings(&input_ids, &img_embeds)?;
+
+            // M-RoPE positions
+            let single_grid = grid_thw.narrow(0, grid_thw_vec.iter().position(|g| g == grid).unwrap_or(0), 1)?;
+            let (position_ids, _) = self.compute_mrope_positions(&input_ids, &single_grid)?;
+            let (cos, sin) = self.mrope.forward(&position_ids)?;
+
+            // Forward through decoder (returns all hidden states)
+            self.decoder.clear_kv_cache();
+            let hidden = self.decoder.forward_hidden(
+                input_embeds, &cos, &sin,
+                Some(&deepstack_features), Some(&vision_mask),
+            )?;
+
+            // Project + L2 normalize
+            let proj = self.project_and_normalize(&hidden)?;
+
+            all_embeddings.push(proj.squeeze(0)?); // (seq_len, dims)
+            vis_offset += n_vis_tokens;
+        }
+
+        Ok(all_embeddings)
+    }
+
+    /// Encode a batch of text queries into multi-vector embeddings.
+    /// Returns one tensor per query, each of shape (num_tokens, dims).
+    pub fn encode_queries(&mut self, queries: &[&str]) -> Result<Vec<Tensor>> {
+        let mut all_embeddings = Vec::new();
+
+        for query in queries {
+            // Build query with prefix + augmentation tokens
+            let processed = format!(
+                "{}{}{}",
+                QUERY_PREFIX,
+                query,
+                QUERY_AUGMENTATION_TOKEN.repeat(QUERY_AUGMENTATION_COUNT),
+            );
+
+            let input_ids = self.tokenizer.encode(processed.as_str(), false)
+                .map_err(|e| E::msg(format!("Tokenizer: {}", e)))?
+                .get_ids().to_vec();
+
+            let seq_len = input_ids.len();
+
+            // Token embeddings (no vision)
+            let ids_tensor = Tensor::new(input_ids.as_slice(), &self.device)?.unsqueeze(0)?;
+            let input_embeds = self.decoder.embed(&ids_tensor)?;
+
+            // M-RoPE: text-only → all 3 dims get same sequential positions
+            let positions: Vec<i64> = (0..seq_len as i64).collect();
+            let pos_tensor = Tensor::new(positions.as_slice(), &self.device)?;
+            let position_ids = Tensor::stack(&[pos_tensor.clone(), pos_tensor.clone(), pos_tensor], 0)?;
+            let (cos, sin) = self.mrope.forward(&position_ids)?;
+
+            // Forward (no vision features)
+            self.decoder.clear_kv_cache();
+            let hidden = self.decoder.forward_hidden(
+                input_embeds, &cos, &sin, None, None,
+            )?;
+
+            // Project + L2 normalize
+            let proj = self.project_and_normalize(&hidden)?;
+
+            // All tokens are valid (no masking needed for queries)
+            all_embeddings.push(proj.squeeze(0)?); // (seq_len, dims)
+        }
+
+        Ok(all_embeddings)
+    }
+
+    /// ColBERT-style MaxSim scoring between query and passage embeddings.
+    /// Returns (num_queries, num_passages) score matrix.
+    pub fn score(
+        qs: &[Tensor],
+        ps: &[Tensor],
+        batch_size: usize,
+    ) -> Result<Tensor> {
+        if qs.is_empty() || ps.is_empty() {
+            anyhow::bail!("Empty query or passage embeddings");
+        }
+
+        let device = qs[0].device();
+        let mut scores_list: Vec<Tensor> = Vec::new();
+
+        for i in (0..qs.len()).step_by(batch_size) {
+            let end_q = (i + batch_size).min(qs.len());
+            let qs_batch = Tensor::stack(&qs[i..end_q], 0)?.to_device(device)?;
+            let mut scores_batch = Vec::new();
+
+            for j in (0..ps.len()).step_by(batch_size) {
+                let end_p = (j + batch_size).min(ps.len());
+                let ps_batch = Tensor::stack(&ps[j..end_p], 0)?.to_device(device)?;
+
+                // MaxSim: einsum("bnd,csd->bcns").max(dim=3).sum(dim=2)
+                // qs_batch: (bq, sq, d), ps_batch: (bp, sp, d)
+                // For each (q_i, p_j): score = sum over q_tok of max over p_tok of dot(q_tok, p_tok)
+                let bq = qs_batch.dim(0)?;
+                let bp = ps_batch.dim(0)?;
+
+                let mut batch_scores = Vec::new();
+                for qi in 0..bq {
+                    let q = qs_batch.i(qi)?; // (sq, d)
+                    let mut q_scores = Vec::new();
+                    for pj in 0..bp {
+                        let p = ps_batch.i(pj)?; // (sp, d)
+                        // (sq, d) @ (d, sp) → (sq, sp)
+                        let dots = q.matmul(&p.t()?)?;
+                        // max over sp dim, then sum over sq dim
+                        let max_sim = dots.max(D::Minus1)?; // (sq,)
+                        let score = max_sim.sum_all()?; // scalar
+                        q_scores.push(score);
+                    }
+                    batch_scores.push(Tensor::stack(&q_scores, 0)?);
+                }
+                scores_batch.push(Tensor::stack(&batch_scores, 0)?);
+            }
+            scores_list.push(Tensor::cat(&scores_batch, 1)?);
+        }
+
+        let scores = Tensor::cat(&scores_list, 0)?.to_dtype(DType::F32)?;
+        Ok(scores)
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────
+
+    /// Apply custom_text_proj + L2 normalization.
+    fn project_and_normalize(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
+        let proj = self.custom_text_proj.forward(hidden)?;
+
+        // Truncate if dims < hidden_size
+        let proj = if self.dims < self.config.text_config.hidden_size {
+            proj.narrow(D::Minus1, 0, self.dims)?
+        } else {
+            proj
+        };
+
+        // L2 normalize
+        let norm = proj.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
+        let norm = (norm + 1e-12)?;
+        proj.broadcast_div(&norm)
+    }
+
+    fn build_visual_prompt(&self, n_vis_tokens: usize) -> String {
+        // Build the visual prompt template matching the Python processor
+        let mut prompt = String::from("<|im_start|>user\n<|vision_start|>");
+        for _ in 0..n_vis_tokens {
+            prompt.push_str("<|image_pad|>");
+        }
+        prompt.push_str("<|vision_end|>Describe the image.<|im_end|>\n<|im_start|>assistant\n<|endoftext|>");
+        prompt
+    }
+
+    fn compute_mrope_positions(
+        &self,
+        input_ids: &[u32],
+        grid_thw: &Tensor,
+    ) -> Result<(Tensor, i64)> {
+        let grid_thw_vec = grid_thw.to_vec2::<u32>()?;
+        let merge = self.config.vision_config.spatial_merge_size as i64;
+        let image_token = self.config.image_token_id;
+
+        let seq_len = input_ids.len();
+        let mut t_pos = vec![0i64; seq_len];
+        let mut h_pos = vec![0i64; seq_len];
+        let mut w_pos = vec![0i64; seq_len];
+
+        let mut text_pos: i64 = 0;
+        let mut img_idx = 0;
+        let mut i = 0;
+
+        while i < seq_len {
+            if input_ids[i] == image_token && img_idx < grid_thw_vec.len() {
+                let grid = &grid_thw_vec[img_idx];
+                let t = grid[0] as i64;
+                let h = (grid[1] as i64) / merge;
+                let w = (grid[2] as i64) / merge;
+                let n_tokens = (t * h * w) as usize;
+
+                let mut idx = 0;
+                for frame in 0..t {
+                    for row in 0..h {
+                        for col in 0..w {
+                            if i + idx < seq_len {
+                                t_pos[i + idx] = text_pos + frame;
+                                h_pos[i + idx] = text_pos + row;
+                                w_pos[i + idx] = text_pos + col;
+                            }
+                            idx += 1;
+                        }
+                    }
+                }
+
+                let max_dim = std::cmp::max(t, std::cmp::max(h, w));
+                text_pos += max_dim;
+                i += n_tokens;
+                img_idx += 1;
+            } else {
+                t_pos[i] = text_pos;
+                h_pos[i] = text_pos;
+                w_pos[i] = text_pos;
+                text_pos += 1;
+                i += 1;
+            }
+        }
+
+        let t_tensor = Tensor::new(t_pos, &self.device)?;
+        let h_tensor = Tensor::new(h_pos, &self.device)?;
+        let w_tensor = Tensor::new(w_pos, &self.device)?;
+        let position_ids = Tensor::stack(&[t_tensor, h_tensor, w_tensor], 0)?;
+        Ok((position_ids, text_pos))
+    }
+
+    fn merge_embeddings(
+        &self,
+        input_ids: &[u32],
+        image_embeds: &Tensor,
+    ) -> candle_core::Result<(Tensor, Tensor)> {
+        let image_token = self.config.image_token_id;
+        let num_vis_tokens = image_embeds.dim(0)?;
+        let mut parts: Vec<Tensor> = Vec::new();
+        let mut mask_vals: Vec<f32> = Vec::new();
+        let mut vis_idx = 0;
+        let mut current_text: Vec<u32> = Vec::new();
+        let mut vis_run_start: Option<usize> = None;
+        let mut vis_run_len = 0usize;
+
+        for &id in input_ids {
+            if id == image_token && vis_idx < num_vis_tokens {
+                if !current_text.is_empty() {
+                    let ids = Tensor::new(current_text.as_slice(), &self.device)?;
+                    let emb = self.decoder.embed(&ids)?;
+                    mask_vals.extend(std::iter::repeat(0.0f32).take(current_text.len()));
+                    parts.push(emb);
+                    current_text.clear();
+                }
+                if vis_run_start.is_none() {
+                    vis_run_start = Some(vis_idx);
+                    vis_run_len = 0;
+                }
+                vis_run_len += 1;
+                vis_idx += 1;
+            } else {
+                if let Some(start) = vis_run_start.take() {
+                    let block = image_embeds.narrow(0, start, vis_run_len)?;
+                    parts.push(block);
+                    mask_vals.extend(std::iter::repeat(1.0f32).take(vis_run_len));
+                    vis_run_len = 0;
+                }
+                current_text.push(id);
+            }
+        }
+        if let Some(start) = vis_run_start.take() {
+            let block = image_embeds.narrow(0, start, vis_run_len)?;
+            parts.push(block);
+            mask_vals.extend(std::iter::repeat(1.0f32).take(vis_run_len));
+        }
+        if !current_text.is_empty() {
+            let ids = Tensor::new(current_text.as_slice(), &self.device)?;
+            let emb = self.decoder.embed(&ids)?;
+            mask_vals.extend(std::iter::repeat(0.0f32).take(current_text.len()));
+            parts.push(emb);
+        }
+
+        let combined = Tensor::cat(&parts, 0)?.unsqueeze(0)?;
+        let mask = Tensor::new(mask_vals, &self.device)?;
+        Ok((combined, mask))
+    }
+
+    fn preprocess_images<P: AsRef<Path>>(
+        &self,
+        image_paths: &[P],
+    ) -> Result<(Tensor, Tensor)> {
+        let merge_size = self.preproc_cfg.merge_size;
+        let patch_size = self.preproc_cfg.patch_size;
+        let temporal_patch_size = self.preproc_cfg.temporal_patch_size;
+        let factor = patch_size * merge_size;
+        let min_pixels = self.preproc_cfg.size.shortest_edge;
+        let max_pixels = self.preproc_cfg.size.longest_edge;
+
+        let mut all_pixels = Vec::new();
+        let mut all_grid_thw = Vec::new();
+
+        for path in image_paths {
+            let img = image::open(path.as_ref())?;
+            let img = img.to_rgb8();
+            let (w, h) = (img.width(), img.height());
+
+            let (rh, rw) = crate::utils::image_utils::smart_resize(
+                h as usize, w as usize, factor, min_pixels, max_pixels,
+            )?;
+            let img = image::imageops::resize(&img, rw as u32, rh as u32, image::imageops::FilterType::CatmullRom);
+
+            let raw: Vec<u8> = img.into_raw();
+            let raw_tensor = Tensor::from_vec(raw, (rh, rw, 3), &Device::Cpu)?
+                .permute((2, 0, 1))?
+                .to_device(&self.device)?;
+            let raw_f32 = (raw_tensor.to_dtype(DType::F32)? * (1.0 / 255.0))?;
+            let tensor = raw_f32.broadcast_sub(&self.img_mean)?.broadcast_div(&self.img_std)?
+                .unsqueeze(0)?.to_dtype(self.dtype)?;
+
+            // Duplicate for temporal dim (images → 2 frames)
+            let tensor = Tensor::cat(&[&tensor, &tensor], 0)?;
+
+            let grid_t = 2usize / temporal_patch_size;
+            let grid_h = rh / patch_size;
+            let grid_w = rw / patch_size;
+
+            let tensor = tensor.reshape(Shape::from(vec![
+                grid_t, temporal_patch_size,
+                3,
+                grid_h / merge_size, merge_size, patch_size,
+                grid_w / merge_size, merge_size, patch_size,
+            ]))?;
+            let tensor = tensor.permute(vec![0, 3, 6, 4, 7, 2, 1, 5, 8])?;
+            let tensor = tensor.reshape((
+                grid_t * grid_h * grid_w,
+                3 * temporal_patch_size * patch_size * patch_size,
+            ))?.contiguous()?;
+
+            all_pixels.push(tensor);
+            all_grid_thw.push(Tensor::from_vec(
+                vec![grid_t as u32, grid_h as u32, grid_w as u32],
+                (1, 3),
+                &self.device,
+            )?);
+        }
+
+        let pixel_values = Tensor::cat(&all_pixels, 0)?;
+        let grid_thw = Tensor::cat(&all_grid_thw, 0)?;
+        Ok((pixel_values, grid_thw))
+    }
+}
