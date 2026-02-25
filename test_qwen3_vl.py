@@ -25,7 +25,9 @@ Usage:
 """
 
 import argparse
+import base64
 import json
+import mimetypes
 import os
 import sys
 import time
@@ -63,8 +65,18 @@ def load_schema(schema_arg: str) -> str:
         sys.exit(1)
 
 
+def image_to_data_uri(img_path: str) -> str:
+    """Read an image file and return a data:image/...;base64,... URI."""
+    mime, _ = mimetypes.guess_type(img_path)
+    if mime is None:
+        mime = "image/jpeg"
+    with open(img_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
 def build_content(image_paths: list[str], schema_text: str) -> list[dict]:
-    """Build the OpenAI-style content array with images + text."""
+    """Build the OpenAI-style content array with base64 images + text."""
     content = []
 
     for img_path in image_paths:
@@ -74,7 +86,7 @@ def build_content(image_paths: list[str], schema_text: str) -> list[dict]:
             continue
         content.append({
             "type": "image_url",
-            "image_url": {"url": f"file://{abs_path}"}
+            "image_url": {"url": image_to_data_uri(abs_path)}
         })
 
     prompt = PROMPT_TEMPLATE.format(schema=schema_text)
@@ -100,7 +112,13 @@ def call_server(url: str, content: list[dict], max_tokens: int, stream: bool = F
         json=payload,
         timeout=300,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        try:
+            err = resp.json()
+            msg = err.get("error", {}).get("message", resp.text)
+        except Exception:
+            msg = resp.text
+        raise RuntimeError(f"Server error {resp.status_code}: {msg}")
     data = resp.json()
     return data["choices"][0]["message"]["content"]
 
@@ -280,9 +298,12 @@ Examples:
         content = []
         for img_path in image_paths:
             abs_path = os.path.abspath(img_path)
+            if not os.path.isfile(abs_path):
+                print(f"Warning: image not found: {abs_path}")
+                continue
             content.append({
                 "type": "image_url",
-                "image_url": {"url": f"file://{abs_path}"}
+                "image_url": {"url": image_to_data_uri(abs_path)}
             })
         content.append({"type": "text", "text": human_text})
 
