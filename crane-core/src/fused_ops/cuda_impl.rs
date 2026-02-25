@@ -198,66 +198,135 @@ pub fn fused_silu_mul(gate_up: &Tensor, intermediate_size: usize) -> Result<Tens
 // 2. Fused residual_add + RMSNorm
 // =====================================================================
 
-/// Fused residual addition + RMSNorm.
+/// Fused residual addition + RMSNorm in one kernel pass.
 ///
-/// Computes: `residual += hidden; out = rmsnorm(residual, weight, eps)`
-/// in one pass. The `residual` tensor is updated **in-place**.
+/// Computes:
+///   `sum = residual + hidden`
+///   `normalized = rmsnorm(sum, weight, eps)`
 ///
-/// Returns the normalized output tensor.
-pub struct FusedAddRmsNorm {
-    pub eps: f32,
-}
-
-impl FusedAddRmsNorm {
-    /// Execute the fused add+rmsnorm on CUDA.
-    ///
-    /// `residual` is updated in-place. Returns normalized output.
-    pub fn fwd(
-        &self,
-        residual: &mut Tensor,
-        hidden: &Tensor,
-        weight: &Tensor,
-    ) -> Result<Tensor> {
-        // Ensure all contiguous
-        let residual_c = residual.contiguous()?;
-        let hidden = hidden.contiguous()?;
-        let weight = weight.contiguous()?;
-
-        match residual_c.device() {
-            Device::Cuda(_) => {
-                self.cuda_fwd_inplace(residual, &hidden, &weight)
-            }
-            _ => {
-                // CPU fallback: just do add + rmsnorm separately
-                let sum = (&residual_c + &hidden)?;
-                *residual = sum.clone();
-                let norm = candle_nn::RmsNorm::new(weight.clone(), self.eps as f64);
-                candle_core::Module::forward(&norm, &sum)
-            }
+/// Returns `(sum, normalized)`. Both outputs are written in a single
+/// kernel pass, halving memory reads compared to separate add + rmsnorm.
+///
+/// On CUDA with BF16: dispatches to `fused_add_rmsnorm_out_bf16` kernel.
+/// Otherwise: falls back to separate candle ops.
+pub fn fused_add_rmsnorm(
+    residual: &Tensor,
+    hidden: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    {
+        if residual.dtype() == DType::BF16
+            && residual.device().is_cuda()
+            && residual.is_contiguous()
+        {
+            return fused_add_rmsnorm_cuda(residual, hidden, weight, eps as f32);
         }
     }
 
-    #[cfg(feature = "cuda")]
-    fn cuda_fwd_inplace(
-        &self,
-        residual: &mut Tensor,
-        hidden: &Tensor,
-        weight: &Tensor,
-    ) -> Result<Tensor> {
-        // For simplicity of the in-place update, fall back to two-op path
-        // but use candle ops (no extra allocation for the sum since the
-        // memory pool recycles).
-        //
-        // The true in-place version requires unsafe access to the residual's
-        // internal CudaSlice which candle doesn't expose cleanly for writes.
-        // We'll keep the fused kernel for future use when candle adds
-        // in-place mutation support, and for now just eliminate the allocation
-        // overhead via memory pool + event tracking disable.
-        let sum = (residual.contiguous()? + hidden)?;
-        *residual = sum.clone();
-        let norm = candle_nn::RmsNorm::new(weight.clone(), self.eps as f64);
-        candle_core::Module::forward(&norm, &sum)
+    // CPU / non-BF16 fallback: separate add + rmsnorm
+    let sum = (residual + hidden)?;
+    let norm = candle_nn::RmsNorm::new(weight.clone(), eps);
+    let normalized = candle_core::Module::forward(&norm, &sum)?;
+    Ok((sum, normalized))
+}
+
+#[cfg(feature = "cuda")]
+fn fused_add_rmsnorm_cuda(
+    residual: &Tensor,
+    hidden: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    let hidden = hidden.contiguous()?;
+    let weight = weight.contiguous()?;
+
+    let dims = residual.dims();
+    let ncols = dims[dims.len() - 1];
+    let nrows: usize = dims[..dims.len() - 1].iter().product();
+
+    let dev = match residual.device() {
+        Device::Cuda(d) => d,
+        _ => unreachable!(),
+    };
+
+    let func = load_func!(dev, "fused_add_rmsnorm_out_bf16")?;
+    let block_size = 1024u32.min(ncols as u32);
+    let cfg = LaunchConfig {
+        grid_dim: (nrows as u32, 1, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // Pre-allocate output tensors
+    let sum_tensor = Tensor::zeros(residual.shape(), DType::BF16, residual.device())?;
+    let norm_tensor = Tensor::zeros(residual.shape(), DType::BF16, residual.device())?;
+
+    // Launch fused kernel — writes into sum_tensor and norm_tensor's
+    // backing memory. Same write-through-shared-storage pattern as slice_set.
+    {
+        let (res_guard, res_layout) = residual.storage_and_layout();
+        let (hid_guard, hid_layout) = hidden.storage_and_layout();
+        let (wt_guard, wt_layout) = weight.storage_and_layout();
+        let (sum_guard, _) = sum_tensor.storage_and_layout();
+        let (norm_guard, _) = norm_tensor.storage_and_layout();
+
+        let res_cuda = match &*res_guard {
+            candle_core::Storage::Cuda(s) => s,
+            _ => unreachable!(),
+        };
+        let hid_cuda = match &*hid_guard {
+            candle_core::Storage::Cuda(s) => s,
+            _ => unreachable!(),
+        };
+        let wt_cuda = match &*wt_guard {
+            candle_core::Storage::Cuda(s) => s,
+            _ => unreachable!(),
+        };
+        let sum_cuda = match &*sum_guard {
+            candle_core::Storage::Cuda(s) => s,
+            _ => unreachable!(),
+        };
+        let norm_cuda = match &*norm_guard {
+            candle_core::Storage::Cuda(s) => s,
+            _ => unreachable!(),
+        };
+
+        match (
+            &res_cuda.slice,
+            &hid_cuda.slice,
+            &wt_cuda.slice,
+            &sum_cuda.slice,
+            &norm_cuda.slice,
+        ) {
+            (
+                CudaStorageSlice::BF16(res_s),
+                CudaStorageSlice::BF16(hid_s),
+                CudaStorageSlice::BF16(wt_s),
+                CudaStorageSlice::BF16(sum_s),
+                CudaStorageSlice::BF16(norm_s),
+            ) => {
+                let res_s = res_s.slice(res_layout.start_offset()..);
+                let hid_s = hid_s.slice(hid_layout.start_offset()..);
+                let wt_s = wt_s.slice(wt_layout.start_offset()..);
+
+                let mut builder = func.builder();
+                builder.arg(&res_s); // residual (read)
+                builder.arg(&hid_s); // hidden (read)
+                builder.arg(sum_s); // sum output (write)
+                builder.arg(norm_s); // norm output (write)
+                builder.arg(&wt_s); // weight (read)
+                let ncols_i32 = ncols as i32;
+                builder.arg(&ncols_i32);
+                builder.arg(&eps);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            _ => candle_core::bail!("fused_add_rmsnorm: all inputs must be BF16"),
+        }
     }
+
+    Ok((sum_tensor, norm_tensor))
 }
 
 // =====================================================================
