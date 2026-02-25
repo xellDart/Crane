@@ -61,11 +61,68 @@ pub enum VlmRequest {
 //  Image downloading
 // ─────────────────────────────────────────────────────────────
 
-/// Download an image from a URL to a temporary file.
-/// Returns the path to the temp file (the file persists until the TempDir is dropped).
+/// Resolve an image URL to a local file path.
+/// Supports:
+///   - data:image/jpeg;base64,...  → decode base64 to temp file
+///   - file:///absolute/path.jpg   → uses the local file directly
+///   - /absolute/path.jpg          → uses the local file directly
+///   - http(s)://...               → downloads to temp file
 async fn download_image(url: &str) -> Result<(tempfile::TempDir, std::path::PathBuf), String> {
+    use base64::Engine;
+
     let dir = tempfile::TempDir::new()
         .map_err(|e| format!("Failed to create temp dir: {e}"))?;
+
+    // Handle base64 data URIs: data:image/jpeg;base64,/9j/4AAQ...
+    if url.starts_with("data:") {
+        let parts: Vec<&str> = url.splitn(2, ',').collect();
+        if parts.len() != 2 {
+            return Err("Invalid data URI: missing comma separator".into());
+        }
+        let header = parts[0]; // "data:image/jpeg;base64"
+        let b64_data = parts[1];
+
+        let ext = if header.contains("image/png") {
+            "png"
+        } else if header.contains("image/webp") {
+            "webp"
+        } else {
+            "jpg"
+        };
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64_data)
+            .map_err(|e| format!("Failed to decode base64 image: {e}"))?;
+
+        let dest = dir.path().join(format!("image.{ext}"));
+        std::fs::write(&dest, &bytes)
+            .map_err(|e| format!("Failed to write decoded image: {e}"))?;
+        return Ok((dir, dest));
+    }
+
+    // Handle local file paths (file:// scheme or absolute paths)
+    if url.starts_with("file://") {
+        let local_path = std::path::PathBuf::from(url.strip_prefix("file://").unwrap());
+        if !local_path.exists() {
+            return Err(format!("Local image not found: {}", local_path.display()));
+        }
+        let ext = local_path.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
+        let dest = dir.path().join(format!("image.{ext}"));
+        std::fs::copy(&local_path, &dest)
+            .map_err(|e| format!("Failed to copy local image: {e}"))?;
+        return Ok((dir, dest));
+    }
+    if url.starts_with('/') {
+        let local_path = std::path::PathBuf::from(url);
+        if !local_path.exists() {
+            return Err(format!("Local image not found: {}", local_path.display()));
+        }
+        let ext = local_path.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
+        let dest = dir.path().join(format!("image.{ext}"));
+        std::fs::copy(&local_path, &dest)
+            .map_err(|e| format!("Failed to copy local image: {e}"))?;
+        return Ok((dir, dest));
+    }
 
     let resp = reqwest::get(url)
         .await
