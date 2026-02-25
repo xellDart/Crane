@@ -62,4 +62,5 @@ path = "src/qwen3_vl_simple.rs"
 default = []
 onnx = ["crane/onnx"]
 cuda = ["crane-core/cuda"]
+flash-attn = ["cuda", "crane-core/flash-attn"]
 
