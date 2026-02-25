@@ -933,10 +933,21 @@ impl TextDecoder {
             layers.push(TextDecoderLayer::new(cfg, vb.pp(&format!("layers.{}", i)))?);
         }
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
+
+        // Keep lm_head in F32 for BF16 models: cuBLAS computes BF16 matmul with F32
+        // accumulation but casts output back to BF16, which can flip argmax at the EOS
+        // boundary. F32 lm_head preserves full accumulation precision → correct token selection.
+        let is_bf16 = vb.dtype() == DType::BF16;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::new(embed_tokens.embeddings().clone(), None)
+            let w = embed_tokens.embeddings().clone();
+            Linear::new(if is_bf16 { w.to_dtype(DType::F32)? } else { w }, None)
         } else {
-            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+            let raw = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+            if is_bf16 {
+                Linear::new(raw.weight().to_dtype(DType::F32)?, None)
+            } else {
+                raw
+            }
         };
         Ok(Self {
             embed_tokens,
@@ -1011,7 +1022,10 @@ impl TextDecoder {
         }
 
         let h = self.norm.forward(&h)?;
-        h.narrow(1, seq_len - 1, 1)?.apply(&self.lm_head)
+        let h = h.narrow(1, seq_len - 1, 1)?;
+        // Cast to F32 for lm_head when BF16 (lm_head weights stored in F32 for precision)
+        let h = if self.dtype == DType::BF16 { h.to_dtype(DType::F32)? } else { h };
+        h.apply(&self.lm_head)
     }
 
     fn forward_ids(
