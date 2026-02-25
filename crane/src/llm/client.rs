@@ -18,7 +18,7 @@ enum LoadedModel {
 
 /// LLM client for various language models
 pub struct LlmClient {
-    config: CommonConfig,
+    _config: CommonConfig,
     model: LoadedModel,
 }
 
@@ -81,7 +81,7 @@ impl LlmClient {
             }
         };
 
-        Ok(Self { config, model })
+        Ok(Self { _config: config, model })
     }
 
     /// Generate text using the model

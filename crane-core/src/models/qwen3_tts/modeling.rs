@@ -601,7 +601,7 @@ pub struct CodePredictor {
     /// Projection from talker hidden → code predictor hidden (if sizes differ)
     small_to_mtp_projection: Option<Linear>,
     rotary_emb: RotaryEmbedding,
-    config: CodePredictorConfig,
+    _config: CodePredictorConfig,
     num_code_groups: usize,
 }
 
@@ -671,7 +671,7 @@ impl CodePredictor {
             lm_heads,
             small_to_mtp_projection,
             rotary_emb,
-            config: config.clone(),
+            _config: config.clone(),
             num_code_groups: config.num_code_groups,
         })
     }
@@ -1437,7 +1437,7 @@ impl SeRes2NetBlock {
         let h = self.res2net.forward(&h)?;
         let h = self.tdnn2.forward(&h)?;
         let h = self.se.forward(&h)?;
-        (h + x)
+        h + x
     }
 }
 
@@ -1642,6 +1642,7 @@ impl Qwen3TTSModel {
     /// Build a causal mask for new tokens attending to previous KV cache + themselves.
     /// Shape: `[1, 1, seq_len, offset + seq_len]`.
     /// New token i can attend to all positions 0..(offset + i), but not future positions.
+    #[allow(dead_code)]
     fn build_causal_mask_with_offset(seq_len: usize, offset: usize, device: &Device, dtype: DType) -> Result<Tensor> {
         let full_len = offset + seq_len;
         let mut mask_data = vec![0f32; seq_len * full_len];

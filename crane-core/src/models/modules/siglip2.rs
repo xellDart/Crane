@@ -64,7 +64,7 @@ pub struct Siglip2Attention {
     num_heads: usize,
     head_dim: usize,
     scale: f64,
-    dropout: f32,
+    _dropout: f32,
 }
 
 impl Siglip2Attention {
@@ -86,7 +86,7 @@ impl Siglip2Attention {
             num_heads,
             head_dim,
             scale: 1.0 / (head_dim as f64).sqrt(),
-            dropout: config.attention_dropout,
+            _dropout: config.attention_dropout,
         })
     }
 
@@ -173,7 +173,7 @@ impl Siglip2EncoderLayer {
 #[derive(Debug)]
 pub struct Siglip2Encoder {
     layers: Vec<Siglip2EncoderLayer>,
-    gradient_checkpointing: bool,
+    _gradient_checkpointing: bool,
 }
 
 impl Siglip2Encoder {
@@ -185,7 +185,7 @@ impl Siglip2Encoder {
         }
         Ok(Self {
             layers,
-            gradient_checkpointing: false,
+            _gradient_checkpointing: false,
         })
     }
 
@@ -204,7 +204,7 @@ pub struct Siglip2VisionEmbeddings {
     position_embedding: Embedding,
     position_embedding_size: usize,
     num_patches: usize,
-    patch_size: usize,
+    _patch_size: usize,
 }
 
 impl Siglip2VisionEmbeddings {
@@ -232,7 +232,7 @@ impl Siglip2VisionEmbeddings {
             position_embedding,
             position_embedding_size: (config.image_size / config.patch_size) as usize,
             num_patches: config.num_patches,
-            patch_size: config.patch_size,
+            _patch_size: config.patch_size,
         })
     }
 
@@ -317,7 +317,7 @@ pub struct Siglip2VisionTransformer {
     embeddings: Siglip2VisionEmbeddings,
     encoder: Siglip2Encoder,
     post_layernorm: LayerNorm,
-    use_head: bool,
+    _use_head: bool,
     head: Option<Siglip2MultiheadAttentionPoolingHead>,
 }
 
@@ -345,7 +345,7 @@ impl Siglip2VisionTransformer {
             embeddings,
             encoder,
             post_layernorm,
-            use_head: config.vision_use_head,
+            _use_head: config.vision_use_head,
             head,
         })
     }

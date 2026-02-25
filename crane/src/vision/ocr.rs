@@ -7,7 +7,7 @@ use ribo::utils::log::info;
 use std::path::Path;
 
 pub struct OcrClient {
-    config: CommonConfig,
+    _config: CommonConfig,
     model: PaddleOcrVL,
 }
 
@@ -59,7 +59,7 @@ impl OcrClient {
             }
         }
 
-        Ok(Self { config, model })
+        Ok(Self { _config: config, model })
     }
 
     pub fn extract_text_from_image<P: AsRef<Path>>(

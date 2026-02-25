@@ -357,7 +357,7 @@ impl TokenizerAttention {
     }
 
     fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
-        let (b, t, c) = hidden.dims3()?;
+        let (b, t, _c) = hidden.dims3()?;
         let q = hidden
             .apply(&self.q_proj)?
             .reshape((b, t, self.num_heads, self.head_dim))?
@@ -820,7 +820,7 @@ impl VectorQuantization {
 #[derive(Debug, Clone)]
 struct ResidualVectorQuantization {
     layers: Vec<VectorQuantization>,
-    dim: usize,
+    _dim: usize,
 }
 
 impl ResidualVectorQuantization {
@@ -829,7 +829,7 @@ impl ResidualVectorQuantization {
         for i in 0..num_quantizers {
             layers.push(VectorQuantization::new(dim, codebook_size, vb.pp("layers").pp(i))?);
         }
-        Ok(Self { layers, dim })
+        Ok(Self { layers, _dim: dim })
     }
 
     fn decode(&self, codes: &Tensor) -> Result<Tensor> {
@@ -1130,6 +1130,7 @@ impl EncoderTransformerLayer {
 
 /// EuclideanCodebook encode: nearest-neighbor lookup.
 impl EuclideanCodebook {
+    #[allow(dead_code)]
     fn encode(&self, x: &Tensor) -> Result<Tensor> {
         // x: [B, T, dim] or [T, dim]
         let usage = self.cluster_usage.clamp(self.epsilon, f64::INFINITY)?
@@ -1162,6 +1163,7 @@ impl EuclideanCodebook {
 }
 
 impl VectorQuantization {
+    #[allow(dead_code)]
     fn encode(&self, x: &Tensor) -> Result<Tensor> {
         // x: [B, D, T] → transpose to [B, T, D] for codebook lookup
         let x_btd = x.transpose(1, 2)?;
@@ -1441,8 +1443,8 @@ pub struct NativeSpeechTokenizerDecoder {
     decoder: Vec<DecoderTailLayer>,
     encoder: Option<MimiEncoder>,
     encoder_hf: Option<HfMimiEncoder>,
-    device: Device,
-    dtype: DType,
+    _device: Device,
+    _dtype: DType,
 }
 
 /// HF Mimi encoder path (official-style): audio [B,1,N] -> codes [B,T,valid_n_q].
@@ -1452,7 +1454,7 @@ struct HfMimiEncoder {
     encoder_transformer: RefCell<mimi::transformer::ProjectedTransformer>,
     downsample: mimi::conv::ConvDownsample1d,
     quantizer: mimi::quantization::SplitResidualVectorQuantizer,
-    device: Device,
+    _device: Device,
     valid_num_quantizers: usize,
 }
 
@@ -1506,7 +1508,7 @@ impl HfMimiEncoder {
             encoder_transformer: RefCell::new(encoder_transformer),
             downsample,
             quantizer,
-            device: device.clone(),
+            _device: device.clone(),
             valid_num_quantizers: valid_n_q,
         })
     }
@@ -1640,8 +1642,8 @@ impl NativeSpeechTokenizerDecoder {
             decoder,
             encoder,
             encoder_hf,
-            device: device.clone(),
-            dtype,
+            _device: device.clone(),
+            _dtype: dtype,
         })
     }
 

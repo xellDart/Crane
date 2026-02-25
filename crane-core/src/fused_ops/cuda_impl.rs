@@ -6,7 +6,7 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
-use candle_core::{CudaDevice, DType, Device, Layout, Result, Shape, Tensor, WithDType};
+use candle_core::{DType, Device, Layout, Result, Shape, Tensor, WithDType};
 
 // PTX compiled from kernels/fused_ops.cu — embedded at build time.
 mod ptx {
@@ -443,7 +443,7 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
         storage: &CudaStorage,
         layout: &candle_core::Layout,
     ) -> Result<(CudaStorage, Shape)> {
-        use candle_core::cuda_backend::{CudaDType, WrapErr};
+        use candle_core::cuda_backend::WrapErr;
 
         if !layout.is_contiguous() {
             candle_core::bail!("topk_indices requires contiguous layout");

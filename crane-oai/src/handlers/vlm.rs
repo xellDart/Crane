@@ -16,6 +16,8 @@ use axum::{
 
 use crane_core::models::paddleocr_vl::OcrTask;
 
+use futures::future::join_all;
+
 use crate::openai_api::*;
 use crate::sglang_api::*;
 use crate::{make_error, now_epoch, AppState};
@@ -63,39 +65,15 @@ pub enum VlmRequest {
 
 /// Resolve an image URL to a local file path.
 /// Supports:
-///   - data:image/jpeg;base64,...  → decode base64 to temp file
-///   - http(s)://...               → downloads to temp file
+///   - data:image/jpeg;base64,...  → decode base64 to temp file (offloaded to blocking thread)
+///   - http(s)://...               → downloads to temp file (async)
 async fn download_image(url: &str) -> Result<(tempfile::TempDir, std::path::PathBuf), String> {
-    use base64::Engine;
-
-    let dir = tempfile::TempDir::new()
-        .map_err(|e| format!("Failed to create temp dir: {e}"))?;
-
-    // Handle base64 data URIs: data:image/jpeg;base64,/9j/4AAQ...
+    // Handle base64 data URIs: offload CPU-bound decode to blocking thread pool
     if url.starts_with("data:") {
-        let parts: Vec<&str> = url.splitn(2, ',').collect();
-        if parts.len() != 2 {
-            return Err("Invalid data URI: missing comma separator".into());
-        }
-        let header = parts[0]; // "data:image/jpeg;base64"
-        let b64_data = parts[1];
-
-        let ext = if header.contains("image/png") {
-            "png"
-        } else if header.contains("image/webp") {
-            "webp"
-        } else {
-            "jpg"
-        };
-
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64_data)
-            .map_err(|e| format!("Failed to decode base64 image: {e}"))?;
-
-        let dest = dir.path().join(format!("image.{ext}"));
-        std::fs::write(&dest, &bytes)
-            .map_err(|e| format!("Failed to write decoded image: {e}"))?;
-        return Ok((dir, dest));
+        let url_owned = url.to_string();
+        return tokio::task::spawn_blocking(move || decode_base64_image(&url_owned))
+            .await
+            .map_err(|e| format!("Base64 decode task failed: {e}"))?;
     }
 
     let resp = reqwest::get(url)
@@ -110,43 +88,84 @@ async fn download_image(url: &str) -> Result<(tempfile::TempDir, std::path::Path
         ));
     }
 
-    // Determine extension from content-type or URL.
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "".to_string());
+        .unwrap_or_default();
 
     let bytes = resp
         .bytes()
         .await
         .map_err(|e| format!("Failed to read image bytes: {e}"))?;
 
-    let ext = if content_type.contains("image/png") {
+    // Write to temp file on blocking thread pool
+    let url_owned = url.to_string();
+    tokio::task::spawn_blocking(move || {
+        let dir = tempfile::TempDir::new()
+            .map_err(|e| format!("Failed to create temp dir: {e}"))?;
+
+        let ext = detect_image_ext_from_content_type(&content_type, &url_owned);
+        let img_path = dir.path().join(format!("image.{ext}"));
+        std::fs::write(&img_path, &bytes)
+            .map_err(|e| format!("Failed to write image to temp file: {e}"))?;
+        Ok((dir, img_path))
+    })
+    .await
+    .map_err(|e| format!("Image write task failed: {e}"))?
+}
+
+/// Decode a base64 data URI to a temp file (runs on blocking thread).
+fn decode_base64_image(url: &str) -> Result<(tempfile::TempDir, std::path::PathBuf), String> {
+    use base64::Engine;
+
+    let dir = tempfile::TempDir::new()
+        .map_err(|e| format!("Failed to create temp dir: {e}"))?;
+
+    let parts: Vec<&str> = url.splitn(2, ',').collect();
+    if parts.len() != 2 {
+        return Err("Invalid data URI: missing comma separator".into());
+    }
+    let header = parts[0];
+    let b64_data = parts[1];
+
+    let ext = if header.contains("image/png") {
+        "png"
+    } else if header.contains("image/webp") {
+        "webp"
+    } else {
+        "jpg"
+    };
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64_data)
+        .map_err(|e| format!("Failed to decode base64 image: {e}"))?;
+
+    let dest = dir.path().join(format!("image.{ext}"));
+    std::fs::write(&dest, &bytes)
+        .map_err(|e| format!("Failed to write decoded image: {e}"))?;
+    Ok((dir, dest))
+}
+
+/// Determine image file extension from content-type header or URL.
+fn detect_image_ext_from_content_type<'a>(content_type: &str, url: &str) -> &'a str {
+    if content_type.contains("image/png") {
         "png"
     } else if content_type.contains("image/webp") {
         "webp"
     } else if content_type.contains("image/jpeg") || content_type.contains("image/jpg") {
         "jpg"
     } else {
-        // Fallback to URL extension
         let url_lower = url.to_lowercase();
         if url_lower.contains(".png") {
             "png"
         } else if url_lower.contains(".webp") {
             "webp"
         } else {
-            "jpg" // safe default
+            "jpg"
         }
-    };
-
-    let img_path = dir.path().join(format!("image.{ext}"));
-
-    std::fs::write(&img_path, &bytes)
-        .map_err(|e| format!("Failed to write image to temp file: {e}"))?;
-
-    Ok((dir, img_path))
+    }
 }
 
 /// Determine the OCR task from the text prompt.
@@ -201,13 +220,15 @@ pub async fn vlm_chat_completions(
         ));
     }
 
-    // Download all images.
+    // Download all images concurrently.
+    let download_futures: Vec<_> = image_urls.iter()
+        .map(|url| download_image(url))
+        .collect();
+    let download_results = join_all(download_futures).await;
     let mut temp_dirs = Vec::new();
     let mut img_paths = Vec::new();
-    for url in &image_urls {
-        let (td, ip) = download_image(url)
-            .await
-            .map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
+    for result in download_results {
+        let (td, ip) = result.map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
         temp_dirs.push(td);
         img_paths.push(ip);
     }
@@ -219,7 +240,7 @@ pub async fn vlm_chat_completions(
     if req.stream {
         // Streaming mode
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
         let send_result = if is_qwen3_vl {
             vlm_tx.send(VlmRequest::Qwen3VlRecognizeStream {
@@ -265,11 +286,8 @@ pub async fn vlm_chat_completions(
             };
             yield Ok::<_, std::convert::Infallible>(Event::default().json_data(&first_chunk).unwrap());
 
-            let mut completion_tokens = 0usize;
-
             // Stream tokens.
             while let Some(text) = rx.recv().await {
-                completion_tokens += 1;
                 let chunk = ChatCompletionChunk {
                     id: request_id.clone(),
                     object: "chat.completion.chunk".into(),
@@ -382,7 +400,7 @@ pub async fn vlm_generate(
     })?;
 
     // Download image.
-    let (temp_dir, img_path) = download_image(image_url)
+    let (_temp_dir, img_path) = download_image(image_url)
         .await
         .map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
 
@@ -395,7 +413,7 @@ pub async fn vlm_generate(
 
     if req.stream {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
         if vlm_tx.send(VlmRequest::RecognizeStream {
             img_path,
