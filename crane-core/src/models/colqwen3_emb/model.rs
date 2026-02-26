@@ -126,6 +126,14 @@ impl ColQwen3Emb {
         Ok(Self { vision, decoder, mrope, custom_text_proj, tokenizer, config, preproc_cfg, dims, device, dtype, img_mean, img_std })
     }
 
+    /// Override the output embedding dimensions (Matryoshka truncation).
+    /// Must be ≤ the projection layer output size (config.dims).
+    pub fn set_dims(&mut self, dims: usize) {
+        assert!(dims <= self.config.dims, "target dims ({}) > projection dims ({})", dims, self.config.dims);
+        println!("ColQwen3 dims overridden: {} → {}", self.dims, dims);
+        self.dims = dims;
+    }
+
     /// Encode a batch of images into multi-vector embeddings.
     /// Returns one tensor per image, each of shape (num_tokens, dims).
     pub fn encode_images<P: AsRef<Path>>(&mut self, image_paths: &[P]) -> Result<Vec<Tensor>> {
@@ -181,6 +189,52 @@ impl ColQwen3Emb {
         Ok(all_embeddings)
     }
 
+    /// Encode images from raw bytes (JPEG/PNG) into multi-vector embeddings.
+    /// Avoids disk I/O — images are decoded directly from memory.
+    pub fn encode_images_from_bytes(&mut self, images: &[&[u8]]) -> Result<Vec<Tensor>> {
+        let (pixel_values, grid_thw) = self.preprocess_images_from_bytes(images)?;
+
+        let (image_embeds, deepstack_features) = self.vision.forward(&pixel_values, &grid_thw)?;
+
+        let grid_thw_vec = grid_thw.to_vec2::<u32>()?;
+        let merge = self.config.vision_config.spatial_merge_size as u32;
+
+        let mut all_embeddings = Vec::new();
+        let mut vis_offset = 0usize;
+
+        for grid in &grid_thw_vec {
+            let t = grid[0];
+            let h = grid[1] / merge;
+            let w = grid[2] / merge;
+            let n_vis_tokens = (t * h * w) as usize;
+
+            let img_embeds = image_embeds.narrow(0, vis_offset, n_vis_tokens)?;
+
+            let prompt = self.build_visual_prompt(n_vis_tokens);
+            let input_ids = self.tokenizer.encode(prompt.as_str(), false)
+                .map_err(|e| E::msg(format!("Tokenizer: {}", e)))?
+                .get_ids().to_vec();
+
+            let (input_embeds, vision_mask) = self.merge_embeddings(&input_ids, &img_embeds)?;
+
+            let single_grid = grid_thw.narrow(0, grid_thw_vec.iter().position(|g| g == grid).unwrap_or(0), 1)?;
+            let (position_ids, _) = self.compute_mrope_positions(&input_ids, &single_grid)?;
+            let (cos, sin) = self.mrope.forward(&position_ids)?;
+
+            self.decoder.clear_kv_cache();
+            let hidden = self.decoder.forward_hidden(
+                input_embeds, &cos, &sin,
+                Some(&deepstack_features), Some(&vision_mask),
+            )?;
+
+            let proj = self.project_and_normalize(&hidden)?;
+            all_embeddings.push(proj.squeeze(0)?);
+            vis_offset += n_vis_tokens;
+        }
+
+        Ok(all_embeddings)
+    }
+
     /// Encode a batch of text queries into multi-vector embeddings.
     /// Returns one tensor per query, each of shape (num_tokens, dims).
     pub fn encode_queries(&mut self, queries: &[&str]) -> Result<Vec<Tensor>> {
@@ -229,6 +283,9 @@ impl ColQwen3Emb {
 
     /// ColBERT-style MaxSim scoring between query and passage embeddings.
     /// Returns (num_queries, num_passages) score matrix.
+    ///
+    /// Vectorized: pads all passages to max_seq_len, stacks into a single tensor,
+    /// then scores all passages in one batched matmul per query chunk.
     pub fn score(
         qs: &[Tensor],
         ps: &[Tensor],
@@ -239,41 +296,56 @@ impl ColQwen3Emb {
         }
 
         let device = qs[0].device();
+        let dims = qs[0].dim(D::Minus1)?;
+
+        // Pad all passages to max_seq_len and stack into (N, max_sp, dims)
+        let max_sp = ps.iter().map(|p| p.dim(0).unwrap_or(0)).max().unwrap_or(0);
+        let mut padded_ps = Vec::with_capacity(ps.len());
+        for p in ps {
+            let sp = p.dim(0)?;
+            if sp < max_sp {
+                let pad = Tensor::zeros((max_sp - sp, dims), p.dtype(), device)?;
+                padded_ps.push(Tensor::cat(&[p, &pad], 0)?);
+            } else {
+                padded_ps.push(p.clone());
+            }
+        }
+        // (N_pages, max_sp, dims)
+        let ps_stacked = Tensor::stack(&padded_ps, 0)?;
+        // (N_pages, dims, max_sp) for matmul
+        let ps_t = ps_stacked.transpose(1, 2)?.contiguous()?;
+
         let mut scores_list: Vec<Tensor> = Vec::new();
 
         for i in (0..qs.len()).step_by(batch_size) {
             let end_q = (i + batch_size).min(qs.len());
-            let qs_batch = Tensor::stack(&qs[i..end_q], 0)?.to_device(device)?;
-            let mut scores_batch = Vec::new();
+            let mut q_scores_all = Vec::new();
 
-            for j in (0..ps.len()).step_by(batch_size) {
-                let end_p = (j + batch_size).min(ps.len());
-                let ps_batch = Tensor::stack(&ps[j..end_p], 0)?.to_device(device)?;
+            for qi in i..end_q {
+                let q = &qs[qi]; // (sq, dims)
+                let sq = q.dim(0)?;
 
-                // MaxSim: einsum("bnd,csd->bcns").max(dim=3).sum(dim=2)
-                // qs_batch: (bq, sq, d), ps_batch: (bp, sp, d)
-                // For each (q_i, p_j): score = sum over q_tok of max over p_tok of dot(q_tok, p_tok)
-                let bq = qs_batch.dim(0)?;
-                let bp = ps_batch.dim(0)?;
+                // Process passages in chunks to limit VRAM
+                let mut chunk_scores = Vec::new();
+                for j in (0..ps.len()).step_by(batch_size) {
+                    let end_p = (j + batch_size).min(ps.len());
+                    let ps_chunk = ps_t.narrow(0, j, end_p - j)?; // (chunk, dims, max_sp)
+                    let chunk_size = end_p - j;
 
-                let mut batch_scores = Vec::new();
-                for qi in 0..bq {
-                    let q = qs_batch.i(qi)?; // (sq, d)
-                    let mut q_scores = Vec::new();
-                    for pj in 0..bp {
-                        let p = ps_batch.i(pj)?; // (sp, d)
-                        // (sq, d) @ (d, sp) → (sq, sp)
-                        let dots = q.matmul(&p.t()?)?;
-                        // max over sp dim, then sum over sq dim
-                        let max_sim = dots.max(D::Minus1)?; // (sq,)
-                        let score = max_sim.sum_all()?; // scalar
-                        q_scores.push(score);
-                    }
-                    batch_scores.push(Tensor::stack(&q_scores, 0)?);
+                    // q: (sq, dims) → broadcast (chunk, sq, dims)
+                    let q_expanded = q.unsqueeze(0)?.expand(&[chunk_size, sq, dims])?;
+
+                    // (chunk, sq, dims) @ (chunk, dims, max_sp) → (chunk, sq, max_sp)
+                    let dots = q_expanded.matmul(&ps_chunk)?;
+
+                    // max over max_sp dim → (chunk, sq), sum over sq → (chunk,)
+                    let max_sim = dots.max(D::Minus1)?;
+                    let scores = max_sim.sum(D::Minus1)?; // (chunk,)
+                    chunk_scores.push(scores);
                 }
-                scores_batch.push(Tensor::stack(&batch_scores, 0)?);
+                q_scores_all.push(Tensor::cat(&chunk_scores, 0)?); // (N_pages,)
             }
-            scores_list.push(Tensor::cat(&scores_batch, 1)?);
+            scores_list.push(Tensor::stack(&q_scores_all, 0)?);
         }
 
         let scores = Tensor::cat(&scores_list, 0)?.to_dtype(DType::F32)?;
@@ -286,8 +358,8 @@ impl ColQwen3Emb {
     fn project_and_normalize(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
         let proj = self.custom_text_proj.forward(hidden)?;
 
-        // Truncate if dims < hidden_size
-        let proj = if self.dims < self.config.text_config.hidden_size {
+        // Matryoshka truncation: take first `dims` dimensions if less than projection output
+        let proj = if self.dims < self.config.dims {
             proj.narrow(D::Minus1, 0, self.dims)?
         } else {
             proj
@@ -425,9 +497,10 @@ impl ColQwen3Emb {
         Ok((combined, mask))
     }
 
-    fn preprocess_images<P: AsRef<Path>>(
+    /// Preprocess a single RGB image into pixel patches + grid_thw.
+    fn preprocess_one_image(
         &self,
-        image_paths: &[P],
+        img: image::RgbImage,
     ) -> Result<(Tensor, Tensor)> {
         let merge_size = self.preproc_cfg.merge_size;
         let patch_size = self.preproc_cfg.patch_size;
@@ -436,52 +509,79 @@ impl ColQwen3Emb {
         let min_pixels = self.preproc_cfg.size.shortest_edge;
         let max_pixels = self.preproc_cfg.size.longest_edge;
 
+        let (w, h) = (img.width(), img.height());
+        let (rh, rw) = crate::utils::image_utils::smart_resize(
+            h as usize, w as usize, factor, min_pixels, max_pixels,
+        )?;
+        let img = image::imageops::resize(&img, rw as u32, rh as u32, image::imageops::FilterType::CatmullRom);
+
+        let raw: Vec<u8> = img.into_raw();
+        let raw_tensor = Tensor::from_vec(raw, (rh, rw, 3), &Device::Cpu)?
+            .permute((2, 0, 1))?
+            .to_device(&self.device)?;
+        let raw_f32 = (raw_tensor.to_dtype(DType::F32)? * (1.0 / 255.0))?;
+        let tensor = raw_f32.broadcast_sub(&self.img_mean)?.broadcast_div(&self.img_std)?
+            .unsqueeze(0)?.to_dtype(self.dtype)?;
+
+        let tensor = Tensor::cat(&[&tensor, &tensor], 0)?;
+
+        let grid_t = 2usize / temporal_patch_size;
+        let grid_h = rh / patch_size;
+        let grid_w = rw / patch_size;
+
+        let tensor = tensor.reshape(Shape::from(vec![
+            grid_t, temporal_patch_size,
+            3,
+            grid_h / merge_size, merge_size, patch_size,
+            grid_w / merge_size, merge_size, patch_size,
+        ]))?;
+        let tensor = tensor.permute(vec![0, 3, 6, 4, 7, 2, 1, 5, 8])?;
+        let tensor = tensor.reshape((
+            grid_t * grid_h * grid_w,
+            3 * temporal_patch_size * patch_size * patch_size,
+        ))?.contiguous()?;
+
+        let grid = Tensor::from_vec(
+            vec![grid_t as u32, grid_h as u32, grid_w as u32],
+            (1, 3),
+            &self.device,
+        )?;
+        Ok((tensor, grid))
+    }
+
+    fn preprocess_images<P: AsRef<Path>>(
+        &self,
+        image_paths: &[P],
+    ) -> Result<(Tensor, Tensor)> {
         let mut all_pixels = Vec::new();
         let mut all_grid_thw = Vec::new();
 
         for path in image_paths {
-            let img = image::open(path.as_ref())?;
-            let img = img.to_rgb8();
-            let (w, h) = (img.width(), img.height());
+            let img = image::open(path.as_ref())?.to_rgb8();
+            let (pixels, grid) = self.preprocess_one_image(img)?;
+            all_pixels.push(pixels);
+            all_grid_thw.push(grid);
+        }
 
-            let (rh, rw) = crate::utils::image_utils::smart_resize(
-                h as usize, w as usize, factor, min_pixels, max_pixels,
-            )?;
-            let img = image::imageops::resize(&img, rw as u32, rh as u32, image::imageops::FilterType::CatmullRom);
+        let pixel_values = Tensor::cat(&all_pixels, 0)?;
+        let grid_thw = Tensor::cat(&all_grid_thw, 0)?;
+        Ok((pixel_values, grid_thw))
+    }
 
-            let raw: Vec<u8> = img.into_raw();
-            let raw_tensor = Tensor::from_vec(raw, (rh, rw, 3), &Device::Cpu)?
-                .permute((2, 0, 1))?
-                .to_device(&self.device)?;
-            let raw_f32 = (raw_tensor.to_dtype(DType::F32)? * (1.0 / 255.0))?;
-            let tensor = raw_f32.broadcast_sub(&self.img_mean)?.broadcast_div(&self.img_std)?
-                .unsqueeze(0)?.to_dtype(self.dtype)?;
+    fn preprocess_images_from_bytes(
+        &self,
+        images_bytes: &[&[u8]],
+    ) -> Result<(Tensor, Tensor)> {
+        let mut all_pixels = Vec::new();
+        let mut all_grid_thw = Vec::new();
 
-            // Duplicate for temporal dim (images → 2 frames)
-            let tensor = Tensor::cat(&[&tensor, &tensor], 0)?;
-
-            let grid_t = 2usize / temporal_patch_size;
-            let grid_h = rh / patch_size;
-            let grid_w = rw / patch_size;
-
-            let tensor = tensor.reshape(Shape::from(vec![
-                grid_t, temporal_patch_size,
-                3,
-                grid_h / merge_size, merge_size, patch_size,
-                grid_w / merge_size, merge_size, patch_size,
-            ]))?;
-            let tensor = tensor.permute(vec![0, 3, 6, 4, 7, 2, 1, 5, 8])?;
-            let tensor = tensor.reshape((
-                grid_t * grid_h * grid_w,
-                3 * temporal_patch_size * patch_size * patch_size,
-            ))?.contiguous()?;
-
-            all_pixels.push(tensor);
-            all_grid_thw.push(Tensor::from_vec(
-                vec![grid_t as u32, grid_h as u32, grid_w as u32],
-                (1, 3),
-                &self.device,
-            )?);
+        for bytes in images_bytes {
+            let img = image::load_from_memory(bytes)
+                .map_err(|e| E::msg(format!("Failed to decode image: {}", e)))?
+                .to_rgb8();
+            let (pixels, grid) = self.preprocess_one_image(img)?;
+            all_pixels.push(pixels);
+            all_grid_thw.push(grid);
         }
 
         let pixel_values = Tensor::cat(&all_pixels, 0)?;
