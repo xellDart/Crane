@@ -52,7 +52,7 @@ use backend::ModelBackend;
 use crane_core::utils::token_output_stream::TokenOutputStream;
 use sampling::SamplingBuffers;
 use scheduler::{Scheduler, SchedulerOutput};
-use sequence::{Sequence, SequenceStatus};
+use sequence::{Sequence, SequenceStatus, VlmState};
 
 // ─────────────────────────────────────────────────────────────
 //  Memory configuration
@@ -194,6 +194,12 @@ fn format_bytes_engine(bytes: u64) -> String {
 /// runs out of memory.
 const KV_GPU_OVERHEAD_FACTOR: u64 = 6;
 
+/// VLM request data stored until the sequence finishes (needed for re-prefill after eviction).
+struct VlmRequestData {
+    images: Vec<Vec<u8>>,
+    prompt: String,
+}
+
 /// Continuous-batching inference engine.
 ///
 /// Runs on a dedicated OS thread (model forward passes are synchronous).
@@ -226,6 +232,9 @@ pub struct InferenceEngine {
     /// grant a short cooldown after preemption to avoid a deadlock where
     /// cuMemGetInfo always reports over-limit.
     eviction_cooldown: u32,
+    /// VLM request data (images + prompt) per sequence.
+    /// Kept until sequence finishes — needed for re-prefill after eviction.
+    vlm_request_data: HashMap<String, VlmRequestData>,
 }
 
 impl InferenceEngine {
@@ -270,6 +279,7 @@ impl InferenceEngine {
             last_mem_warn: Instant::now() - std::time::Duration::from_secs(60),
             tracked_kv_bytes: 0,
             eviction_cooldown: 0,
+            vlm_request_data: HashMap::new(),
         };
         let handle = EngineHandle {
             request_tx,
@@ -578,8 +588,15 @@ impl InferenceEngine {
             if let Some(seq) = self.sequences.get_mut(&victim_id) {
                 seq.kv_caches = vec![None; self.num_layers];
                 seq.status = SequenceStatus::Waiting;
-                // Reset tokens to just the prompt to allow re-prefill.
-                seq.tokens.truncate(seq.prompt_len);
+                // For VLM sequences: reset to empty tokens (will re-prefill from images).
+                if seq.vlm_state.is_some() {
+                    seq.tokens.clear();
+                    seq.prompt_len = 0;
+                    seq.vlm_state = None;
+                } else {
+                    // Reset tokens to just the prompt to allow re-prefill.
+                    seq.tokens.truncate(seq.prompt_len);
+                }
             }
 
             self.tracked_kv_bytes = self.tracked_kv_bytes.saturating_sub(freed);
@@ -626,25 +643,29 @@ impl InferenceEngine {
     }
 
     fn accept_request(&mut self, req: EngineRequest) {
+        let is_vlm = req.vlm_images.is_some();
         let prompt_len = req.tokens.len();
         let tokenizer = self.model.tokenizer().clone();
 
-        // Reject prompts that already exceed max_seq_len.
-        if self.memory_config.max_seq_len > 0 && prompt_len > self.memory_config.max_seq_len {
-            warn!(
-                id = %req.id,
-                prompt_len,
-                max_seq_len = self.memory_config.max_seq_len,
-                "Prompt exceeds max_seq_len, rejecting request",
-            );
-            let _ = req.response_tx.send(EngineResponse::Error(
-                format!(
-                    "Prompt length ({}) exceeds server max_seq_len ({})",
-                    prompt_len, self.memory_config.max_seq_len,
-                ),
-            ));
-            self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
-            return;
+        // For VLM requests, skip prompt_len checks (tokens are empty, will be filled at prefill).
+        if !is_vlm {
+            // Reject prompts that already exceed max_seq_len.
+            if self.memory_config.max_seq_len > 0 && prompt_len > self.memory_config.max_seq_len {
+                warn!(
+                    id = %req.id,
+                    prompt_len,
+                    max_seq_len = self.memory_config.max_seq_len,
+                    "Prompt exceeds max_seq_len, rejecting request",
+                );
+                let _ = req.response_tx.send(EngineResponse::Error(
+                    format!(
+                        "Prompt length ({}) exceeds server max_seq_len ({})",
+                        prompt_len, self.memory_config.max_seq_len,
+                    ),
+                ));
+                self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
 
         // Cap max_tokens to respect max_seq_len.
@@ -653,6 +674,7 @@ impl InferenceEngine {
         info!(
             id = %req.id,
             prompt_len,
+            is_vlm,
             max_tokens = effective_max_tokens,
             temp = ?req.temperature,
             top_p = ?req.top_p,
@@ -664,9 +686,16 @@ impl InferenceEngine {
         );
 
         self.stats.total_requests.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .total_prompt_tokens
-            .fetch_add(prompt_len as u64, Ordering::Relaxed);
+        if !is_vlm {
+            self.stats
+                .total_prompt_tokens
+                .fetch_add(prompt_len as u64, Ordering::Relaxed);
+        }
+
+        // Store VLM data if present (kept until sequence finishes for re-prefill).
+        if let (Some(images), Some(prompt)) = (req.vlm_images, req.vlm_prompt) {
+            self.vlm_request_data.insert(req.id.clone(), VlmRequestData { images, prompt });
+        }
 
         let seq = Sequence {
             id: req.id.clone(),
@@ -687,6 +716,7 @@ impl InferenceEngine {
             repetition_penalty: req.repetition_penalty,
             repeat_last_n: 64,
             response_tx: req.response_tx,
+            vlm_state: None,
         };
 
         let stream = TokenOutputStream::new(tokenizer);
@@ -740,6 +770,12 @@ impl InferenceEngine {
     // ─────────────────────────────────────────────────────────
 
     fn step_prefill(&mut self, seq_id: String) {
+        // Check if this is a VLM request — route to VLM-specific prefill.
+        if self.vlm_request_data.contains_key(&seq_id) {
+            self.step_prefill_vlm(seq_id);
+            return;
+        }
+
         let t0 = Instant::now();
 
         self.swap_in(&seq_id);
@@ -795,6 +831,115 @@ impl InferenceEngine {
             prefill_ms = prefill_us / 1000,
             prefill_tok_s = format!("{:.1}", prefill_tok_s),
             "Prefill complete, first token generated",
+        );
+
+        self.send_token(&seq_id, next_token);
+
+        if self.sequences.get(&seq_id).unwrap().should_stop() {
+            self.finish_sequence(&seq_id);
+        } else {
+            self.scheduler.promote_to_running(seq_id);
+        }
+    }
+
+    /// VLM-specific prefill: run vision encoder + text decoder prefill.
+    fn step_prefill_vlm(&mut self, seq_id: String) {
+        let t0 = Instant::now();
+
+        // Save previous active sequence's KV cache before clearing for VLM prefill.
+        // swap_out uses lazy saves (swap_in extracts later), but VLM prefill
+        // bypasses swap_in and calls clear_kv_cache directly, so we must save now.
+        if let Some(ref prev_id) = self.active_seq_id.clone() {
+            if prev_id != &seq_id && self.model.supports_kv_swap() {
+                let caches = self.model.get_kv_caches();
+                if let Some(vlm_decode) = self.model.get_vlm_decode_state() {
+                    if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
+                        if let Some(ref mut vs) = prev_seq.vlm_state {
+                            vs.next_gen_pos = vlm_decode.0;
+                        }
+                    }
+                }
+                if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
+                    prev_seq.kv_caches = caches;
+                }
+            }
+        }
+
+        // Clear model state for fresh prefill.
+        self.model.clear_kv_cache();
+        self.active_seq_id = Some(seq_id.clone());
+
+        // Get VLM data (images + prompt).
+        let vlm_data = match self.vlm_request_data.get(&seq_id) {
+            Some(d) => d,
+            None => {
+                self.send_error(&seq_id, "VLM request data not found");
+                return;
+            }
+        };
+
+        // Run VLM prefill: vision encode → merge → forward.
+        let (logits, input_ids, next_gen_pos, prefill_len) =
+            match self.model.prefill_vlm(&vlm_data.images, &vlm_data.prompt) {
+                Ok(result) => result,
+                Err(e) => {
+                    self.send_error(&seq_id, &format!("VLM prefill failed: {e}"));
+                    return;
+                }
+            };
+
+        // Populate sequence tokens and state.
+        {
+            let seq = self.sequences.get_mut(&seq_id).unwrap();
+            seq.tokens = input_ids;
+            seq.prompt_len = prefill_len;
+            seq.vlm_state = Some(VlmState {
+                next_gen_pos,
+                prefill_len,
+            });
+        }
+
+        self.stats
+            .total_prompt_tokens
+            .fetch_add(prefill_len as u64, Ordering::Relaxed);
+
+        // Sample first token.
+        let next_token = {
+            let seq = self.sequences.get_mut(&seq_id).unwrap();
+            match sampling::sample(&seq_id, seq, &logits, &mut self.sampling_buffers) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.send_error(&seq_id, &format!("VLM sampling failed: {e}"));
+                    return;
+                }
+            }
+        };
+
+        self.swap_out(&seq_id);
+
+        let prefill_us = t0.elapsed().as_micros() as u64;
+        self.stats
+            .total_prefill_time_us
+            .fetch_add(prefill_us, Ordering::Relaxed);
+
+        let prefill_tok_s = if prefill_us > 0 {
+            (prefill_len as f64) / (prefill_us as f64 / 1_000_000.0)
+        } else {
+            0.0
+        };
+
+        {
+            let seq = self.sequences.get_mut(&seq_id).unwrap();
+            seq.tokens.push(next_token);
+            seq.status = SequenceStatus::Running;
+        }
+
+        info!(
+            id = %seq_id,
+            prefill_len,
+            prefill_ms = prefill_us / 1000,
+            prefill_tok_s = format!("{:.1}", prefill_tok_s),
+            "VLM prefill complete, first token generated",
         );
 
         self.send_token(&seq_id, next_token);
@@ -921,6 +1066,17 @@ impl InferenceEngine {
             .iter()
             .map(|id| *self.sequences.get(id).unwrap().tokens.last().unwrap())
             .collect();
+
+        // VLM: set per-sequence M-RoPE generation positions for batch decode.
+        if self.model.is_vlm() {
+            let vlm_positions: Vec<(i64, usize)> = batch.iter().map(|id| {
+                let seq = self.sequences.get(id).unwrap();
+                seq.vlm_state.as_ref()
+                    .map(|vs| (vs.next_gen_pos, vs.prefill_len))
+                    .unwrap_or((seq.start_pos() as i64, seq.prompt_len))
+            }).collect();
+            self.model.set_batch_vlm_positions(&vlm_positions);
+        }
 
         for round in 0..self.decode_tokens_per_seq {
             if alive.iter().all(|a| !a) {
@@ -1051,6 +1207,19 @@ impl InferenceEngine {
                     }
                     // KV caches changed for multiple sequences — recount.
                     self.recount_kv_bytes();
+
+                    // VLM: save updated gen positions back to sequences.
+                    if self.model.is_vlm() {
+                        for (i, seq_id) in batch.iter().enumerate() {
+                            if alive[i] {
+                                if let Some(seq) = self.sequences.get_mut(seq_id) {
+                                    if let Some(ref mut vs) = seq.vlm_state {
+                                        vs.next_gen_pos += rounds_done as i64;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     error!("Final KV extraction failed: {e}");
@@ -1224,9 +1393,17 @@ impl InferenceEngine {
             return;
         }
 
-        // Save previous active sequence's KV cache from the model.
+        // Save previous active sequence's KV cache (and VLM state) from the model.
         if let Some(ref prev_id) = self.active_seq_id.clone() {
             let caches = self.model.get_kv_caches();
+            // Save VLM decode state from model into sequence.
+            if let Some(vlm_decode) = self.model.get_vlm_decode_state() {
+                if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
+                    if let Some(ref mut vs) = prev_seq.vlm_state {
+                        vs.next_gen_pos = vlm_decode.0;
+                    }
+                }
+            }
             if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
                 prev_seq.kv_caches = caches;
             }
@@ -1239,6 +1416,14 @@ impl InferenceEngine {
             .map(|s| s.kv_caches.clone())
             .unwrap_or_else(|| vec![None; self.num_layers]);
         self.model.set_kv_caches(caches);
+
+        // Restore VLM decode state into model.
+        if let Some(seq) = self.sequences.get(seq_id) {
+            if let Some(ref vs) = seq.vlm_state {
+                self.model.set_vlm_decode_state(vs.next_gen_pos, vs.prefill_len);
+            }
+        }
+
         self.active_seq_id = Some(seq_id.to_string());
 
         self.recount_kv_bytes();
@@ -1258,6 +1443,14 @@ impl InferenceEngine {
         }
         if self.active_seq_id.as_deref() != Some(seq_id) {
             return;
+        }
+        // Save VLM decode state (gen_pos advances during decode).
+        if let Some(vlm_decode) = self.model.get_vlm_decode_state() {
+            if let Some(seq) = self.sequences.get_mut(seq_id) {
+                if let Some(ref mut vs) = seq.vlm_state {
+                    vs.next_gen_pos = vlm_decode.0;
+                }
+            }
         }
         // Drop stale seq cache references (from the last swap_in) to free
         // GPU memory.  swap_in will extract fresh caches from the model
@@ -1375,6 +1568,7 @@ impl InferenceEngine {
 
         self.sequences.remove(seq_id);
         self.token_streams.remove(seq_id);
+        self.vlm_request_data.remove(seq_id);
         self.scheduler.remove(seq_id);
 
         if self.active_seq_id.as_deref() == Some(seq_id) {

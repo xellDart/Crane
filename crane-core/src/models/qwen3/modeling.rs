@@ -1127,7 +1127,7 @@ pub fn build_batch_decode_mask(
 }
 
 /// Pad per-sequence KV caches to `max_len` and stack (right-aligned).
-fn pad_and_stack_kv_caches(
+pub fn pad_and_stack_kv_caches(
     caches: &[&Option<(Tensor, Tensor)>],
     max_len: usize,
     kv_heads: usize,

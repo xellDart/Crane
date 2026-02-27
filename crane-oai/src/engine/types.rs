@@ -18,6 +18,10 @@ pub struct EngineRequest {
     pub repetition_penalty: f32,
     pub eos_token_id: Vec<u32>,
     pub response_tx: mpsc::UnboundedSender<EngineResponse>,
+    /// VLM: raw image bytes for vision-language requests (None for text-only).
+    pub vlm_images: Option<Vec<Vec<u8>>>,
+    /// VLM: user text prompt for vision-language requests (None for text-only).
+    pub vlm_prompt: Option<String>,
 }
 
 /// A response chunk from the engine to an API handler.
@@ -68,6 +72,41 @@ impl EngineHandle {
                 repetition_penalty,
                 eos_token_id,
                 response_tx,
+                vlm_images: None,
+                vlm_prompt: None,
+            })
+            .map_err(|_| anyhow::anyhow!("Engine thread has shut down"))?;
+        Ok(response_rx)
+    }
+
+    /// Submit a VLM (vision-language) request. Images are raw bytes, prompt is user text.
+    /// Returns a receiver for response chunks (same as text-only submit).
+    pub fn submit_vlm(
+        &self,
+        id: String,
+        images: Vec<Vec<u8>>,
+        prompt: String,
+        max_tokens: usize,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        top_k: Option<usize>,
+        repetition_penalty: f32,
+        eos_token_id: Vec<u32>,
+    ) -> anyhow::Result<mpsc::UnboundedReceiver<EngineResponse>> {
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        self.request_tx
+            .send(EngineRequest {
+                id,
+                tokens: vec![],
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                repetition_penalty,
+                eos_token_id,
+                response_tx,
+                vlm_images: Some(images),
+                vlm_prompt: Some(prompt),
             })
             .map_err(|_| anyhow::anyhow!("Engine thread has shut down"))?;
         Ok(response_rx)

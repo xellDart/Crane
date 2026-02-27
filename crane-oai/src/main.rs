@@ -377,9 +377,66 @@ async fn main() -> Result<()> {
         let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
 
         (None, tokenizer, vec![eos_id], chat_template, None, Some(tts_tx))
+    } else if resolved_type == engine::model_factory::ModelType::Qwen3Vl {
+        // Qwen3-VL: load via Qwen3VLBackend and run through the Engine
+        // (supports multi-request concurrency with KV swap).
+        info!("Loading Qwen3-VL model from: {}", args.model_path);
+
+        let use_cpu = args.cpu || {
+            #[cfg(feature = "cuda")]
+            { !candle_core::utils::cuda_is_available() }
+            #[cfg(not(feature = "cuda"))]
+            { true }
+        };
+
+        #[cfg(feature = "cuda")]
+        let use_bf16 = !use_cpu;
+        #[cfg(not(feature = "cuda"))]
+        let use_bf16 = false;
+
+        let qwen3_vl = engine::model_factory::create_qwen3_vl_model(&args.model_path, use_cpu, use_bf16)?;
+        let mut backend: Box<dyn engine::backend::ModelBackend> =
+            Box::new(engine::backend::Qwen3VLBackend::new(qwen3_vl));
+
+        info!("Qwen3-VL loaded successfully, warming up...");
+        backend.warmup();
+
+        let tokenizer = backend.tokenizer().clone();
+        let eos_token_id = backend.eos_token_id();
+        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+
+        // Parse memory config.
+        let mut memory_config = MemoryConfig::parse(
+            args.max_seq_len,
+            args.gpu_memory_limit.as_deref(),
+            &device,
+        );
+        memory_config.record_baseline(&device);
+        let baseline_gpu = memory_config.baseline_gpu_bytes;
+        info!(
+            "Memory config: max_seq_len={}, gpu_limit={}, baseline_gpu={}",
+            if memory_config.max_seq_len == 0 { "unlimited".to_string() } else { memory_config.max_seq_len.to_string() },
+            if memory_config.gpu_memory_limit_bytes == 0 { "unlimited".to_string() } else { format_bytes(memory_config.gpu_memory_limit_bytes) },
+            format_bytes(baseline_gpu),
+        );
+
+        let (engine, handle) = InferenceEngine::new(
+            backend, args.max_concurrent, args.decode_tokens_per_seq, memory_config,
+        );
+
+        std::thread::Builder::new()
+            .name("inference-engine".into())
+            .spawn(move || engine.run())
+            .expect("Failed to spawn engine thread");
+        info!(
+            "Qwen3-VL engine started (max_concurrent={}, decode_tokens_per_seq={})",
+            args.max_concurrent, args.decode_tokens_per_seq,
+        );
+
+        (Some(handle), tokenizer, eos_token_id, chat_template, None, None)
     } else if is_vlm {
-        // VLM path: create model on a dedicated thread to avoid Send/Sync issues.
-        info!("Loading VLM model ({:?}) from: {}", resolved_type, args.model_path);
+        // PaddleOCR-VL: dedicated VLM thread (single-request, no engine).
+        info!("Loading PaddleOCR-VL model from: {}", args.model_path);
 
         let use_cpu = args.cpu || {
             #[cfg(feature = "cuda")]
@@ -394,86 +451,43 @@ async fn main() -> Result<()> {
         let use_bf16 = false;
 
         let model_path_clone = args.model_path.clone();
-        let vlm_type = resolved_type;
         let (vlm_tx, mut vlm_rx) = tokio::sync::mpsc::unbounded_channel::<VlmRequest>();
 
         std::thread::Builder::new()
             .name("vlm-engine".into())
             .spawn(move || {
-                // Load the appropriate VLM model
-                let mut paddle_vlm: Option<crane_core::models::paddleocr_vl::PaddleOcrVL> = None;
-                let mut qwen3_vlm: Option<crane_core::models::qwen3_vl::Qwen3VL> = None;
-
-                match vlm_type {
-                    engine::model_factory::ModelType::Qwen3Vl => {
-                        match engine::model_factory::create_qwen3_vl_model(&model_path_clone, use_cpu, use_bf16) {
-                            Ok(m) => qwen3_vlm = Some(m),
-                            Err(e) => { tracing::error!("Failed to load Qwen3-VL model: {e}"); return; }
-                        }
-                    }
-                    _ => {
-                        match engine::model_factory::create_vlm_model(&model_path_clone, use_cpu, use_bf16) {
-                            Ok(m) => paddle_vlm = Some(m),
-                            Err(e) => { tracing::error!("Failed to load PaddleOCR-VL model: {e}"); return; }
-                        }
-                    }
-                }
-                info!("VLM engine thread started ({:?})", vlm_type);
+                let mut paddle_vlm = match engine::model_factory::create_vlm_model(&model_path_clone, use_cpu, use_bf16) {
+                    Ok(m) => m,
+                    Err(e) => { tracing::error!("Failed to load PaddleOCR-VL model: {e}"); return; }
+                };
+                info!("PaddleOCR-VL engine thread started");
 
                 while let Some(req) = vlm_rx.blocking_recv() {
                     match req {
                         VlmRequest::Recognize { img_path, task, max_tokens, tx } => {
-                            if let Some(ref mut vlm) = paddle_vlm {
-                                let res = vlm.recognize(&img_path, task, max_tokens).map(|r| r.text);
-                                if let Err(ref e) = res { tracing::error!("VLM Recognize failed: {:?}", e); }
-                                let _ = tx.send(res.map_err(|e| e.to_string()));
-                            } else {
-                                let _ = tx.send(Err("PaddleOCR-VL not loaded".into()));
-                            }
+                            let res = paddle_vlm.recognize(&img_path, task, max_tokens).map(|r| r.text);
+                            if let Err(ref e) = res { tracing::error!("VLM Recognize failed: {:?}", e); }
+                            let _ = tx.send(res.map_err(|e| e.to_string()));
                         }
                         VlmRequest::RecognizeStream { img_path, task, max_tokens, token_tx, done_tx } => {
-                            if let Some(ref mut vlm) = paddle_vlm {
-                                let res = vlm.recognize_stream(
-                                    &img_path, task, max_tokens,
-                                    |token_text: &str| { let _ = token_tx.send(token_text.to_string()); }
-                                );
-                                if let Err(ref e) = res { tracing::error!("VLM RecognizeStream failed: {:?}", e); }
-                                let _ = done_tx.send(res.map(|_| ()).map_err(|e| e.to_string()));
-                            } else {
-                                let _ = done_tx.send(Err("PaddleOCR-VL not loaded".into()));
-                            }
+                            let res = paddle_vlm.recognize_stream(
+                                &img_path, task, max_tokens,
+                                |token_text: &str| { let _ = token_tx.send(token_text.to_string()); }
+                            );
+                            if let Err(ref e) = res { tracing::error!("VLM RecognizeStream failed: {:?}", e); }
+                            let _ = done_tx.send(res.map(|_| ()).map_err(|e| e.to_string()));
                         }
-                        VlmRequest::Qwen3VlRecognize { img_paths, prompt, max_tokens, tx } => {
-                            if let Some(ref mut vlm) = qwen3_vlm {
-                                let paths: Vec<&std::path::Path> = img_paths.iter().map(|p| p.as_path()).collect();
-                                let res = vlm.recognize_stream(&paths, &prompt, max_tokens, |_| {}).map(|r| r.text);
-                                if let Err(ref e) = res { tracing::error!("Qwen3-VL Recognize failed: {:?}", e); }
-                                let _ = tx.send(res.map_err(|e| e.to_string()));
-                            } else {
-                                let _ = tx.send(Err("Qwen3-VL not loaded".into()));
-                            }
-                        }
-                        VlmRequest::Qwen3VlRecognizeStream { img_paths, prompt, max_tokens, token_tx, done_tx } => {
-                            if let Some(ref mut vlm) = qwen3_vlm {
-                                let paths: Vec<&std::path::Path> = img_paths.iter().map(|p| p.as_path()).collect();
-                                let res = vlm.recognize_stream(
-                                    &paths, &prompt, max_tokens,
-                                    |token_text: &str| { let _ = token_tx.send(token_text.to_string()); }
-                                );
-                                if let Err(ref e) = res { tracing::error!("Qwen3-VL RecognizeStream failed: {:?}", e); }
-                                let _ = done_tx.send(res.map(|_| ()).map_err(|e| e.to_string()));
-                            } else {
-                                let _ = done_tx.send(Err("Qwen3-VL not loaded".into()));
-                            }
+                        _ => {
+                            // Qwen3-VL requests should never arrive here.
+                            tracing::error!("Received Qwen3-VL request on PaddleOCR thread");
                         }
                     }
                 }
             })
             .expect("Failed to spawn VLM thread");
 
-        info!("VLM model routing established (type: {:?})", resolved_type);
+        info!("PaddleOCR-VL routing established");
 
-        // Use tokenizer from the VLM for API compatibility.
         let tok_path = std::path::Path::new(&args.model_path).join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
@@ -483,7 +497,6 @@ async fn main() -> Result<()> {
             .or_else(|| tokenizer.token_to_id("<|end_of_sentence|>"))
             .unwrap_or(2);
 
-        // Chat template (uses Auto for jinja-based template).
         let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
 
         (None, tokenizer, vec![eos_id], chat_template, Some(vlm_tx), None)
@@ -589,13 +602,16 @@ async fn main() -> Result<()> {
     println!("  {sep}");
     println!("  Model   : {} ({})", model_name, resolved_type.display_name());
     println!("  Device  : {}  │  dtype: {}", state.device_name, state.dtype_name);
-    if is_vlm {
+    if resolved_type == engine::model_factory::ModelType::Qwen3Vl {
+        println!("  Mode    : VLM (vision-language model) — engine with KV swap");
+    } else if is_vlm {
         println!("  Mode    : VLM (vision-language model) — engine bypassed");
     } else if is_tts {
         println!("  Mode    : TTS (text-to-speech) — engine bypassed");
     }
     println!("  Listen  : http://{local_addr}");
-    if !is_vlm {
+    let has_engine = state.engine.is_some();
+    if has_engine {
         if args.max_seq_len > 0 || state.gpu_memory_limit != "unlimited" {
             let seq_str = if args.max_seq_len == 0 { "unlimited".to_string() } else { args.max_seq_len.to_string() };
             let mem_str = state.gpu_memory_limit.clone();

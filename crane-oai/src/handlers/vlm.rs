@@ -189,11 +189,17 @@ fn detect_ocr_task(text: &str) -> OcrTask {
 /// VLM-aware chat completions handler.
 ///
 /// Extracts image URLs and text from multimodal messages, downloads
-/// images, and runs PaddleOCR-VL inference.
+/// images, and runs inference. For Qwen3-VL with engine, routes via
+/// `submit_vlm()`. For PaddleOCR-VL, uses the VLM thread.
 pub async fn vlm_chat_completions(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    // Qwen3-VL with engine: route via submit_vlm for multi-request concurrency.
+    if state.is_qwen3_vl && state.engine.is_some() {
+        return vlm_chat_via_engine(state, req).await;
+    }
+
     let vlm_tx = state.vlm_tx.as_ref().ok_or_else(|| {
         make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM model not loaded")
     })?;
@@ -477,6 +483,248 @@ pub async fn vlm_generate(
             },
         };
 
+        Ok(Json(response).into_response())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Qwen3-VL via Engine (multi-request concurrency)
+// ─────────────────────────────────────────────────────────────
+
+/// Download image URL to raw bytes (no temp files).
+async fn download_image_bytes(url: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+
+    if url.starts_with("data:") {
+        let url_owned = url.to_string();
+        return tokio::task::spawn_blocking(move || {
+            let parts: Vec<&str> = url_owned.splitn(2, ',').collect();
+            if parts.len() != 2 {
+                return Err("Invalid data URI: missing comma separator".into());
+            }
+            base64::engine::general_purpose::STANDARD
+                .decode(parts[1])
+                .map_err(|e| format!("Failed to decode base64 image: {e}"))
+        })
+        .await
+        .map_err(|e| format!("Base64 decode task failed: {e}"))?;
+    }
+
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("Failed to download image from '{}': {e}", url))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Image download failed (HTTP {}): {}", resp.status(), url));
+    }
+
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("Failed to read image bytes: {e}"))
+}
+
+/// Qwen3-VL chat completions routed through the inference engine.
+async fn vlm_chat_via_engine(
+    state: Arc<AppState>,
+    req: ChatCompletionRequest,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    use crate::engine::EngineResponse;
+
+    let engine = state.engine.as_ref().ok_or_else(|| {
+        make_error(StatusCode::INTERNAL_SERVER_ERROR, "Engine not loaded")
+    })?;
+
+    // Extract image URLs and text from messages.
+    let mut image_urls = Vec::new();
+    let mut text_prompt = String::new();
+
+    for msg in &req.messages {
+        if msg.role == "user" {
+            image_urls.extend(msg.image_urls());
+            let text = msg.text_content();
+            if !text.is_empty() {
+                text_prompt = text;
+            }
+        }
+    }
+
+    if image_urls.is_empty() {
+        return Err(make_error(
+            StatusCode::BAD_REQUEST,
+            "No image_url found in messages. VLM requires at least one image.",
+        ));
+    }
+
+    // Download all images to bytes concurrently.
+    let download_futures: Vec<_> = image_urls.iter()
+        .map(|url| download_image_bytes(url))
+        .collect();
+    let download_results = join_all(download_futures).await;
+    let mut images_bytes = Vec::new();
+    for result in download_results {
+        let bytes = result.map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
+        images_bytes.push(bytes);
+    }
+
+    let max_tokens = req.max_tokens;
+    let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let eos_token_id = state.eos_token_id.clone();
+
+    // Submit VLM request to engine.
+    let mut rx = engine.submit_vlm(
+        request_id.clone(),
+        images_bytes,
+        text_prompt,
+        max_tokens,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.repetition_penalty.unwrap_or(1.0),
+        eos_token_id,
+    ).map_err(|e| make_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    if req.stream {
+        let model_name = state.model_name.clone();
+        let created = now_epoch();
+
+        let stream = async_stream::stream! {
+            // Role announcement chunk.
+            let first_chunk = ChatCompletionChunk {
+                id: request_id.clone(),
+                object: "chat.completion.chunk".into(),
+                created,
+                model: model_name.clone(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: Some("assistant".into()),
+                        content: None,
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            };
+            yield Ok::<_, std::convert::Infallible>(Event::default().json_data(&first_chunk).unwrap());
+
+            while let Some(resp) = rx.recv().await {
+                match resp {
+                    EngineResponse::Token { text, .. } => {
+                        let chunk = ChatCompletionChunk {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk".into(),
+                            created,
+                            model: model_name.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: None,
+                                    content: Some(text),
+                                },
+                                finish_reason: None,
+                            }],
+                            usage: None,
+                        };
+                        yield Ok(Event::default().json_data(&chunk).unwrap());
+                    }
+                    EngineResponse::Finished { finish_reason, prompt_tokens, completion_tokens, .. } => {
+                        let finish_chunk = ChatCompletionChunk {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk".into(),
+                            created,
+                            model: model_name.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: None,
+                                    content: None,
+                                },
+                                finish_reason: Some(finish_reason),
+                            }],
+                            usage: Some(Usage {
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens: prompt_tokens + completion_tokens,
+                            }),
+                        };
+                        yield Ok(Event::default().json_data(&finish_chunk).unwrap());
+                        yield Ok(Event::default().data("[DONE]"));
+                        break;
+                    }
+                    EngineResponse::Error(msg) => {
+                        let err_chunk = ChatCompletionChunk {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk".into(),
+                            created,
+                            model: model_name.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: None,
+                                    content: Some(format!("[Error: {}]", msg)),
+                                },
+                                finish_reason: Some("error".into()),
+                            }],
+                            usage: None,
+                        };
+                        yield Ok(Event::default().json_data(&err_chunk).unwrap());
+                        yield Ok(Event::default().data("[DONE]"));
+                        break;
+                    }
+                }
+            }
+        };
+
+        Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response())
+    } else {
+        // Non-streaming: collect all tokens until Finished.
+        let mut full_text = String::new();
+        let mut prompt_tokens = 0;
+        let mut completion_tokens = 0;
+        let mut finish_reason = "stop".to_string();
+
+        while let Some(resp) = rx.recv().await {
+            match resp {
+                EngineResponse::Token { text, .. } => {
+                    full_text.push_str(&text);
+                }
+                EngineResponse::Finished { full_text: ft, prompt_tokens: pt, completion_tokens: ct, finish_reason: fr } => {
+                    full_text = ft;
+                    prompt_tokens = pt;
+                    completion_tokens = ct;
+                    finish_reason = fr;
+                    break;
+                }
+                EngineResponse::Error(msg) => {
+                    return Err(make_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("VLM inference failed: {msg}"),
+                    ));
+                }
+            }
+        }
+
+        let response = ChatCompletionResponse {
+            id: request_id,
+            object: "chat.completion".into(),
+            created: now_epoch(),
+            model: state.model_name.clone(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: ChatMessageContent::Text(full_text),
+                },
+                finish_reason: Some(finish_reason),
+            }],
+            usage: Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            },
+        };
         Ok(Json(response).into_response())
     }
 }

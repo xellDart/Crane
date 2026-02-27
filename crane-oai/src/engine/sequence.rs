@@ -15,6 +15,15 @@ pub fn kv_cache_bytes(caches: &[Option<(Tensor, Tensor)>]) -> u64 {
         .sum()
 }
 
+/// VLM-specific state tracked per sequence (M-RoPE position, prefill length).
+#[derive(Debug, Clone)]
+pub struct VlmState {
+    /// Next generation position for M-RoPE (all 3 dims use this value during decode).
+    pub next_gen_pos: i64,
+    /// Number of tokens in the prefill (prompt + vision tokens).
+    pub prefill_len: usize,
+}
+
 /// Per-request lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -58,6 +67,10 @@ pub struct Sequence {
     // ── response channel ──
     /// Sends `EngineResponse` chunks back to the API handler.
     pub response_tx: mpsc::UnboundedSender<super::EngineResponse>,
+
+    // ── VLM state (only for vision-language requests) ──
+    /// Tracks M-RoPE generation position and prefill length for VLM sequences.
+    pub vlm_state: Option<VlmState>,
 }
 
 impl Sequence {
@@ -147,6 +160,7 @@ mod tests {
             repetition_penalty: 1.0,
             repeat_last_n: 64,
             response_tx: tx,
+            vlm_state: None,
         }
     }
 

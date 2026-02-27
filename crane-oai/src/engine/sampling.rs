@@ -132,7 +132,7 @@ pub fn sample(
     };
     #[cfg(feature = "cuda")]
     {
-        if greedy && seq.repetition_penalty == 1.0 && logits.device().is_cuda() {
+        if greedy && seq.repetition_penalty == 1.0 && logits.device().is_cuda() && logits.dtype() == DType::BF16 {
             let flat = logits.squeeze(0)?.squeeze(0)?;
             let token = crane_core::fused_ops::gpu_argmax(&flat)?;
             if trace {

@@ -670,16 +670,18 @@ impl TextAttention {
         })
     }
 
+    /// `batch_kv_info`: for batch decode, `Some((kv_lens, original_max_kv))` enables
+    /// per-sequence attention that produces results identical to sequential decode.
     fn forward(
         &mut self,
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
         mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
     ) -> candle_core::Result<Tensor> {
         let (b, seq_len, _) = xs.dims3()?;
 
-        // Fused QKV projection: 1 matmul instead of 3
         let (q, k, v) = if let Some(ref qkv) = self.qkv_proj {
             let qkv_out = qkv.forward(xs)?;
             let q = qkv_out.narrow(D::Minus1, 0, self.q_dim)?;
@@ -749,6 +751,37 @@ impl TextAttention {
         // GQA-grouped SDPA for decode (seq_len=1): avoid expanding KV heads
         if self.num_kv_groups > 1 && seq_len == 1 {
             let scale = 1.0 / (self.head_dim as f64).sqrt();
+
+            // Batch decode with per-sequence attention: each sequence computes
+            // attention over ONLY its real KV data (no padding) to handle
+            // different-length KV caches correctly.
+            if let Some((kv_lens, original_max_kv)) = batch_kv_info {
+                if b > 1 {
+                    let rounds_done = self.cache_seq_len - original_max_kv;
+                    let mut outputs = Vec::with_capacity(b);
+                    for i in 0..b {
+                        let q_i = q.narrow(0, i, 1)?; // [1, nh, 1, hd]
+                        let offset = original_max_kv - kv_lens[i];
+                        let real_len = kv_lens[i] + rounds_done;
+                        let k_i = k.narrow(0, i, 1)?.narrow(2, offset, real_len)?.contiguous()?;
+                        let v_i = v.narrow(0, i, 1)?.narrow(2, offset, real_len)?.contiguous()?;
+
+                        let q_g = (q_i.reshape((1, self.num_kv_heads, self.num_kv_groups, self.head_dim))? * scale)?;
+                        let k_t = k_i.transpose(2, 3)?.contiguous()?;
+                        let attn = q_g.contiguous()?.matmul(&k_t)?;
+                        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+                        let out = attn.matmul(&v_i)?;
+                        outputs.push(out);
+                    }
+                    let out = Tensor::cat(&outputs, 0)?; // [N, nh_kv, groups, hd]
+                    let out = out
+                        .reshape((b, self.num_heads, self.head_dim))?
+                        .reshape((b, 1, self.num_heads * self.head_dim))?;
+                    return self.o_proj.forward(&out);
+                }
+            }
+
+            // Sequential decode (b=1): standard path, no mask needed
             let q_g = (q.reshape((b, self.num_kv_heads, self.num_kv_groups, self.head_dim))? * scale)?;
             let k_t = k.transpose(2, 3)?.contiguous()?;
             let attn = q_g.contiguous()?.matmul(&k_t)?;
@@ -871,10 +904,11 @@ impl TextDecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
     ) -> candle_core::Result<Tensor> {
         let residual = xs;
         let xs = self.input_ln.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, cos, sin, mask)?;
+        let xs = self.self_attn.forward(&xs, cos, sin, mask, batch_kv_info)?;
 
         // Fused: new_residual = residual + attn_out; normalized = rmsnorm(new_residual)
         let (new_residual, h) = crate::fused_ops::fused_add_rmsnorm(
@@ -957,6 +991,8 @@ pub struct TextDecoder {
     device: Device,
     dtype: DType,
     hidden_size: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
 }
 
 impl TextDecoder {
@@ -996,6 +1032,8 @@ impl TextDecoder {
             device: vb.device().clone(),
             dtype: vb.dtype(),
             hidden_size: cfg.hidden_size,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
         })
     }
 
@@ -1050,7 +1088,7 @@ impl TextDecoder {
 
         let mut h = xs;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            h = layer.forward(&h, cos, sin, mask.as_ref())?;
+            h = layer.forward(&h, cos, sin, mask.as_ref(), None)?;
 
             // DeepStack: inject vision features at early layers
             if let Some(ref scattered) = scattered_ds {
@@ -1101,7 +1139,7 @@ impl TextDecoder {
 
         let mut h = xs;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            h = layer.forward(&h, cos, sin, mask.as_ref())?;
+            h = layer.forward(&h, cos, sin, mask.as_ref(), None)?;
             if let Some(ref scattered) = scattered_ds {
                 if i < scattered.len() {
                     h = (h + &scattered[i])?;
@@ -1127,6 +1165,201 @@ impl TextDecoder {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
+    }
+
+    /// Number of transformer layers.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Total bytes held by the model's KV caches (no GPU copies).
+    pub fn active_kv_cache_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|l| {
+                l.self_attn
+                    .kv_cache
+                    .as_ref()
+                    .map(|(k, v)| {
+                        let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                        let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                        k_bytes + v_bytes
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    /// Extract per-layer KV caches, narrowed to the valid `cache_seq_len`.
+    pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.layers
+            .iter()
+            .map(|l| {
+                l.self_attn.kv_cache.as_ref().map(|(k, v)| {
+                    let len = l.self_attn.cache_seq_len;
+                    if len > 0 && len < k.dim(2).unwrap_or(0) {
+                        (
+                            k.narrow(2, 0, len)
+                                .and_then(|t| t.contiguous())
+                                .unwrap_or_else(|_| k.clone()),
+                            v.narrow(2, 0, len)
+                                .and_then(|t| t.contiguous())
+                                .unwrap_or_else(|_| v.clone()),
+                        )
+                    } else {
+                        (k.clone(), v.clone())
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Restore per-layer KV caches into the model.
+    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+        for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
+            match cache {
+                Some((k, v)) => {
+                    let seq_len = k.dim(2).unwrap_or(0);
+                    // Pre-allocate room so the first decode step after swap-in
+                    // can do in-place slice_set instead of reallocating.
+                    let room = 256;
+                    let (b, h, _s, d) = k.dims4().unwrap();
+                    let buf_k = Tensor::zeros((b, h, seq_len + room, d), k.dtype(), k.device()).unwrap();
+                    let buf_v = Tensor::zeros((b, h, seq_len + room, d), v.dtype(), v.device()).unwrap();
+                    buf_k.slice_set(&k, 2, 0).unwrap();
+                    buf_v.slice_set(&v, 2, 0).unwrap();
+                    layer.self_attn.kv_cache = Some((buf_k, buf_v));
+                    layer.self_attn.cache_seq_len = seq_len;
+                }
+                None => {
+                    layer.self_attn.kv_cache = None;
+                    layer.self_attn.cache_seq_len = 0;
+                }
+            }
+        }
+    }
+
+    // ── Batched Decode ──────────────────────────────────────────────────
+
+    /// Pad per-sequence KV caches to the same length and load into model layers.
+    /// Returns `(kv_lens, max_kv_len)`.
+    pub fn setup_batch_decode(
+        &mut self,
+        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        extra_room: usize,
+    ) -> candle_core::Result<(Vec<usize>, usize)> {
+        let kv_heads = self.num_kv_heads;
+        let head_dim = self.head_dim;
+        let device = self.embed_tokens.embeddings().device();
+
+        let kv_lens: Vec<usize> = seq_kv_caches
+            .iter()
+            .map(|caches| {
+                caches
+                    .first()
+                    .and_then(|c| c.as_ref())
+                    .map(|(k, _)| k.dim(2).unwrap_or(0))
+                    .unwrap_or(0)
+            })
+            .collect();
+        let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let layer_caches: Vec<&Option<(Tensor, Tensor)>> =
+                seq_kv_caches.iter().map(|seq| &seq[layer_idx]).collect();
+
+            let batched_kv = crate::models::qwen3::modeling::pad_and_stack_kv_caches(
+                &layer_caches,
+                max_kv_len,
+                kv_heads,
+                head_dim,
+                device,
+                self.dtype,
+            )?;
+
+            if let Some((k, v)) = batched_kv {
+                let k = k.contiguous()?;
+                let v = v.contiguous()?;
+                if extra_room > 0 {
+                    let (b, h, s, d) = k.dims4()?;
+                    let buf_k =
+                        Tensor::zeros((b, h, s + extra_room, d), k.dtype(), k.device())?;
+                    let buf_v =
+                        Tensor::zeros((b, h, s + extra_room, d), v.dtype(), v.device())?;
+                    buf_k.slice_set(&k, 2, 0)?;
+                    buf_v.slice_set(&v, 2, 0)?;
+                    layer.self_attn.kv_cache = Some((buf_k, buf_v));
+                } else {
+                    layer.self_attn.kv_cache = Some((k, v));
+                }
+                layer.self_attn.cache_seq_len = max_kv_len;
+            } else {
+                layer.self_attn.kv_cache = None;
+                layer.self_attn.cache_seq_len = 0;
+            }
+        }
+
+        Ok((kv_lens, max_kv_len))
+    }
+
+    /// Run one batched decode step with pre-computed M-RoPE cos/sin.
+    pub fn step_batch_decode(
+        &mut self,
+        input_ids: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
+        let mut h = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
+
+        for (_li, layer) in self.layers.iter_mut().enumerate() {
+            h = layer.forward(&h, cos, sin, attention_mask, batch_kv_info)?;
+        }
+
+        let h = self.norm.forward(&h)?;
+        let h = h.narrow(1, 0, 1)?;
+        let lm_head = self.lm_head.as_ref().expect("lm_head required for generation");
+        let h = if self.dtype == DType::BF16 { h.to_dtype(DType::F32)? } else { h };
+        h.apply(lm_head)
+    }
+
+    /// Extract per-sequence KV caches from batched state.
+    pub fn extract_batch_kv(
+        &mut self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        let n_seqs = kv_lens.len();
+        let num_layers = self.layers.len();
+        let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> = (0..n_seqs)
+            .map(|_| Vec::with_capacity(num_layers))
+            .collect();
+
+        for layer in self.layers.iter_mut() {
+            if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
+                for i in 0..n_seqs {
+                    let row_k = full_k.narrow(0, i, 1)?;
+                    let row_v = full_v.narrow(0, i, 1)?;
+                    let total = kv_lens[i] + rounds_done;
+                    let offset = original_max_kv - kv_lens[i];
+                    let clean = Some((
+                        row_k.narrow(2, offset, total)?.contiguous()?,
+                        row_v.narrow(2, offset, total)?.contiguous()?,
+                    ));
+                    result[i].push(clean);
+                }
+            } else {
+                for i in 0..n_seqs {
+                    result[i].push(None);
+                }
+            }
+            layer.self_attn.kv_cache = None;
+            layer.self_attn.cache_seq_len = 0;
+        }
+
+        Ok(result)
     }
 }
 
@@ -1481,6 +1714,167 @@ impl Qwen3VL {
             let tensor = Tensor::cat(&[&tensor, &tensor], 0)?; // (2, 3, rh, rw)
 
             // Patchify (same as processor.rs process_vision_tensor)
+            let t_dim = 2usize;
+            let grid_t = t_dim / temporal_patch_size;
+            let grid_h = rh / patch_size;
+            let grid_w = rw / patch_size;
+
+            let tensor = tensor.reshape(Shape::from(vec![
+                grid_t, temporal_patch_size,
+                3,
+                grid_h / merge_size, merge_size, patch_size,
+                grid_w / merge_size, merge_size, patch_size,
+            ]))?;
+            let tensor = tensor.permute(vec![0, 3, 6, 4, 7, 2, 1, 5, 8])?;
+            let tensor = tensor.reshape((
+                grid_t * grid_h * grid_w,
+                3 * temporal_patch_size * patch_size * patch_size,
+            ))?.contiguous()?;
+
+            all_pixels.push(tensor);
+            all_grid_thw.push(Tensor::from_vec(
+                vec![grid_t as u32, grid_h as u32, grid_w as u32],
+                (1, 3),
+                &self.device,
+            )?);
+        }
+
+        let pixel_values = Tensor::cat(&all_pixels, 0)?;
+        let grid_thw = Tensor::cat(&all_grid_thw, 0)?;
+        Ok((pixel_values, grid_thw))
+    }
+
+    // ── Public accessors for engine integration ──────────────────────
+
+    /// Mutable reference to the text decoder.
+    pub fn decoder_mut(&mut self) -> &mut TextDecoder {
+        &mut self.decoder
+    }
+
+    /// Reference to the text decoder.
+    pub fn decoder(&self) -> &TextDecoder {
+        &self.decoder
+    }
+
+    /// Reference to the M-RoPE module.
+    pub fn mrope(&self) -> &MRoPE {
+        &self.mrope
+    }
+
+    /// Reference to the tokenizer.
+    pub fn tokenizer_ref(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    /// Reference to the model config.
+    pub fn config(&self) -> &Qwen3VLConfig {
+        &self.config
+    }
+
+    /// Model data type.
+    pub fn model_dtype(&self) -> DType {
+        self.dtype
+    }
+
+    // ── Engine helper: single decode step ────────────────────────────
+
+    /// Decode one token given its ID, the current generation position,
+    /// and the KV cache offset. Returns logits for the next token.
+    pub fn decode_step(
+        &mut self,
+        token_id: u32,
+        gen_pos: i64,
+        kv_offset: usize,
+    ) -> Result<Tensor> {
+        let gen_pos_t = Tensor::new(&[gen_pos], &self.device)?;
+        let gen_pos_3d = Tensor::stack(&[gen_pos_t.clone(), gen_pos_t.clone(), gen_pos_t], 0)?;
+        let (cos, sin) = self.mrope.forward(&gen_pos_3d)?;
+        let token_tensor = Tensor::new(&[token_id], &self.device)?.unsqueeze(0)?;
+        let logits = self.decoder.forward_ids(&token_tensor, &cos, &sin, kv_offset)?;
+        Ok(logits)
+    }
+
+    // ── Engine helper: full prefill from image bytes ─────────────────
+
+    /// Preprocess images from raw bytes (no temp files), run vision encoder,
+    /// build prompt, compute M-RoPE, merge embeddings, prefill.
+    ///
+    /// Returns `(logits, input_ids, next_gen_pos, prefill_len)`.
+    pub fn prefill_from_bytes(
+        &mut self,
+        images: &[Vec<u8>],
+        user_text: &str,
+    ) -> Result<(Tensor, Vec<u32>, i64, usize)> {
+        // 1. Preprocess images from bytes
+        let (pixel_values, grid_thw) = self.preprocess_images_from_bytes(images)?;
+
+        // 2. Vision encoder
+        let (image_embeds, deepstack_features) = self.vision.forward(&pixel_values, &grid_thw)?;
+
+        // 3. Build prompt
+        let prompt = self.build_prompt(user_text, &grid_thw)?;
+
+        // 4. Tokenize
+        let input_ids = self.tokenizer.encode(prompt.as_str(), false)
+            .map_err(|e| E::msg(format!("Tokenizer: {}", e)))?
+            .get_ids().to_vec();
+
+        // 5. Compute M-RoPE
+        let (position_ids, next_gen_pos) = self.compute_mrope_positions(&input_ids, &grid_thw)?;
+        let (cos, sin) = self.mrope.forward(&position_ids)?;
+
+        // 6. Merge embeddings
+        let (input_embeds, vision_mask) = self.merge_embeddings(&input_ids, &image_embeds)?;
+
+        // 7. Forward (prefill)
+        self.decoder.clear_kv_cache();
+        let ds_ref: Vec<Tensor> = deepstack_features;
+        let logits = self.decoder.forward_embeds(
+            input_embeds, &cos, &sin, 0,
+            Some(&ds_ref), Some(&vision_mask),
+        )?;
+
+        let prefill_len = input_ids.len();
+        Ok((logits, input_ids, next_gen_pos, prefill_len))
+    }
+
+    /// Preprocess images from raw bytes (no temp files needed).
+    fn preprocess_images_from_bytes(
+        &self,
+        images: &[Vec<u8>],
+    ) -> Result<(Tensor, Tensor)> {
+        let merge_size = self.preproc_cfg.merge_size;
+        let patch_size = self.preproc_cfg.patch_size;
+        let temporal_patch_size = self.preproc_cfg.temporal_patch_size;
+        let factor = patch_size * merge_size;
+        let min_pixels = self.preproc_cfg.size.shortest_edge;
+        let max_pixels = self.preproc_cfg.size.longest_edge;
+
+        let mut all_pixels = Vec::new();
+        let mut all_grid_thw = Vec::new();
+
+        for raw_bytes in images {
+            let img = image::load_from_memory(raw_bytes)
+                .map_err(|e| E::msg(format!("Failed to decode image from bytes: {e}")))?;
+            let img = img.to_rgb8();
+            let (w, h) = (img.width(), img.height());
+
+            let (rh, rw) = crate::utils::image_utils::smart_resize(
+                h as usize, w as usize, factor, min_pixels, max_pixels,
+            )?;
+            let img = image::imageops::resize(&img, rw as u32, rh as u32, image::imageops::FilterType::CatmullRom);
+
+            // GPU-accelerated normalization
+            let raw: Vec<u8> = img.into_raw();
+            let raw_tensor = Tensor::from_vec(raw, (rh, rw, 3), &Device::Cpu)?
+                .permute((2, 0, 1))?
+                .to_device(&self.device)?;
+            let raw_f32 = (raw_tensor.to_dtype(DType::F32)? * (1.0 / 255.0))?;
+            let tensor = raw_f32.broadcast_sub(&self.img_mean)?.broadcast_div(&self.img_std)?
+                .unsqueeze(0)?.to_dtype(self.dtype)?;
+
+            let tensor = Tensor::cat(&[&tensor, &tensor], 0)?;
+
             let t_dim = 2usize;
             let grid_t = t_dim / temporal_patch_size;
             let grid_h = rh / patch_size;

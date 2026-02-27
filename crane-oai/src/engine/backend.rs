@@ -121,6 +121,36 @@ pub trait ModelBackend: Send + 'static {
     ) -> candle_core::Result<Option<Tensor>> {
         candle_core::bail!("Batch decode not supported by this backend")
     }
+
+    // ── VLM support (for vision-language models) ──────────────────
+
+    /// Whether this backend is a vision-language model.
+    fn is_vlm(&self) -> bool {
+        false
+    }
+
+    /// Run VLM prefill: preprocess images, run vision encoder, build prompt,
+    /// compute M-RoPE, merge embeddings, forward.
+    /// Returns `(logits, input_ids, next_gen_pos, prefill_len)`.
+    fn prefill_vlm(
+        &mut self,
+        _images: &[Vec<u8>],
+        _prompt: &str,
+    ) -> Result<(Tensor, Vec<u32>, i64, usize)> {
+        anyhow::bail!("VLM prefill not supported by this backend")
+    }
+
+    /// Set VLM decode state (gen_pos, prefill_len) after swap-in.
+    fn set_vlm_decode_state(&mut self, _gen_pos: i64, _prefill_len: usize) {}
+
+    /// Get current VLM decode state. Returns None for non-VLM backends.
+    fn get_vlm_decode_state(&self) -> Option<(i64, usize)> {
+        None
+    }
+
+    /// Set per-sequence VLM generation positions for the next batch decode step.
+    /// Each entry is (gen_pos, prefill_len). Only used by VLM backends with batch decode.
+    fn set_batch_vlm_positions(&mut self, _positions: &[(i64, usize)]) {}
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -421,6 +451,208 @@ impl ModelBackend for Qwen3Backend {
     ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
         self.model
             .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
+    }
+
+    fn build_batch_decode_mask(
+        &self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        max_total_width: usize,
+    ) -> candle_core::Result<Option<Tensor>> {
+        crane_core::models::qwen3::modeling::build_batch_decode_mask(
+            kv_lens,
+            original_max_kv,
+            max_total_width,
+            self.device(),
+            self.dtype(),
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Qwen3-VL Backend (Vision-Language Model)
+// ─────────────────────────────────────────────────────────────
+
+pub struct Qwen3VLBackend {
+    pub model: crane_core::models::qwen3_vl::Qwen3VL,
+    /// Current M-RoPE generation position (tracked per active sequence).
+    current_gen_pos: Option<i64>,
+    /// Prefill length of the current active sequence.
+    current_prefill_len: Option<usize>,
+    /// Per-sequence M-RoPE generation positions for batch decode.
+    batch_gen_positions: Vec<i64>,
+}
+
+impl Qwen3VLBackend {
+    pub fn new(model: crane_core::models::qwen3_vl::Qwen3VL) -> Self {
+        Self {
+            model,
+            current_gen_pos: None,
+            current_prefill_len: None,
+            batch_gen_positions: Vec::new(),
+        }
+    }
+}
+
+impl ModelBackend for Qwen3VLBackend {
+    fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
+        // VLM decode: use start_pos as KV cache offset (engine computes this correctly),
+        // but use tracked gen_pos for M-RoPE 3D positions.
+        let gen_pos = self.current_gen_pos
+            .ok_or_else(|| anyhow::anyhow!("VLM forward_step called without decode state"))?;
+
+        assert_eq!(input_ids.len(), 1, "VLM decode expects single token");
+        let logits = self.model.decode_step(input_ids[0], gen_pos, start_pos)?;
+        self.current_gen_pos = Some(gen_pos + 1);
+        Ok(logits)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.model.decoder_mut().clear_kv_cache();
+        self.current_gen_pos = None;
+        self.current_prefill_len = None;
+    }
+
+    fn num_layers(&self) -> usize {
+        self.model.decoder().num_layers()
+    }
+
+    fn device(&self) -> &Device {
+        &self.model.device
+    }
+
+    fn dtype(&self) -> DType {
+        self.model.model_dtype()
+    }
+
+    fn tokenizer(&self) -> &tokenizers::Tokenizer {
+        self.model.tokenizer_ref()
+    }
+
+    fn eos_token_id(&self) -> Vec<u32> {
+        let tok = self.model.tokenizer_ref();
+        let mut ids = Vec::new();
+        if let Some(id) = tok.token_to_id("<|im_end|>") { ids.push(id); }
+        if let Some(id) = tok.token_to_id("<|endoftext|>") { ids.push(id); }
+        if ids.is_empty() { ids.push(151645); }
+        ids
+    }
+
+    fn warmup(&mut self) {
+        // VLM warmup: just clear caches (vision encoder warms up on first use).
+        self.model.decoder_mut().clear_kv_cache();
+    }
+
+    // ── KV swap ──
+
+    fn supports_kv_swap(&self) -> bool {
+        true
+    }
+
+    fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.model.decoder().get_kv_caches()
+    }
+
+    fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+        self.model.decoder_mut().set_kv_caches(caches);
+    }
+
+    fn active_kv_cache_bytes(&self) -> u64 {
+        self.model.decoder().active_kv_cache_bytes()
+    }
+
+    // ── VLM ──
+
+    fn is_vlm(&self) -> bool {
+        true
+    }
+
+    fn prefill_vlm(
+        &mut self,
+        images: &[Vec<u8>],
+        prompt: &str,
+    ) -> Result<(Tensor, Vec<u32>, i64, usize)> {
+        let result = self.model.prefill_from_bytes(images, prompt)?;
+        // Store decode state for subsequent forward_step calls.
+        self.current_gen_pos = Some(result.2);
+        self.current_prefill_len = Some(result.3);
+        Ok(result)
+    }
+
+    fn set_vlm_decode_state(&mut self, gen_pos: i64, prefill_len: usize) {
+        self.current_gen_pos = Some(gen_pos);
+        self.current_prefill_len = Some(prefill_len);
+    }
+
+    fn get_vlm_decode_state(&self) -> Option<(i64, usize)> {
+        match (self.current_gen_pos, self.current_prefill_len) {
+            (Some(gp), Some(pl)) => Some((gp, pl)),
+            _ => None,
+        }
+    }
+
+    fn set_batch_vlm_positions(&mut self, positions: &[(i64, usize)]) {
+        self.batch_gen_positions = positions.iter().map(|(gp, _)| *gp).collect();
+    }
+
+    // ── Batch decode ──
+
+    fn supports_batch_decode(&self) -> bool {
+        true
+    }
+
+    fn setup_batch_decode(
+        &mut self,
+        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        extra_room: usize,
+    ) -> candle_core::Result<(Vec<usize>, usize)> {
+        self.model.decoder_mut().setup_batch_decode(seq_kv_caches, extra_room)
+    }
+
+    fn step_batch_decode(
+        &mut self,
+        input_ids: &Tensor,
+        _positions: &[usize],
+        attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
+        // Build M-RoPE 3D positions from batch_gen_positions.
+        // During decode all 3 dims (temporal, height, width) use the same gen_pos.
+        // Tensor shape is (3, N) row-major: [all_temporal, all_height, all_width].
+        let n = self.batch_gen_positions.len();
+        let device = &self.model.device;
+        let pos_data: Vec<i64> = (0..3)
+            .flat_map(|_| self.batch_gen_positions.iter().copied())
+            .collect();
+        let pos_3d = Tensor::from_vec(pos_data, (3, n), device)?;
+        let (cos, sin) = self.model.mrope().forward(&pos_3d)?;
+        // cos/sin are [N, half_dim], need [N, 1, half_dim] for attention
+        let cos = cos.unsqueeze(1)?;
+        let sin = sin.unsqueeze(1)?;
+
+        let logits = self.model.decoder_mut().step_batch_decode(
+            input_ids,
+            &cos,
+            &sin,
+            attention_mask,
+            batch_kv_info,
+        )?;
+
+        // Auto-increment gen positions for next round.
+        for gp in &mut self.batch_gen_positions {
+            *gp += 1;
+        }
+
+        Ok(logits)
+    }
+
+    fn extract_batch_kv(
+        &mut self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        self.model.decoder_mut().extract_batch_kv(kv_lens, original_max_kv, rounds_done)
     }
 
     fn build_batch_decode_mask(
