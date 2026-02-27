@@ -148,9 +148,10 @@ pub trait ModelBackend: Send + 'static {
         None
     }
 
-    /// Set per-sequence VLM generation positions for the next batch decode step.
-    /// Each entry is (gen_pos, prefill_len). Only used by VLM backends with batch decode.
-    fn set_batch_vlm_positions(&mut self, _positions: &[(i64, usize)]) {}
+    /// Set per-sequence VLM generation positions and precompute M-RoPE for batch decode.
+    /// Each entry is (gen_pos, prefill_len). `num_rounds` is the number of decode rounds.
+    /// Only used by VLM backends with batch decode.
+    fn set_batch_vlm_positions(&mut self, _positions: &[(i64, usize)], _num_rounds: usize) {}
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -481,6 +482,12 @@ pub struct Qwen3VLBackend {
     current_prefill_len: Option<usize>,
     /// Per-sequence M-RoPE generation positions for batch decode.
     batch_gen_positions: Vec<i64>,
+    /// Precomputed M-RoPE cos for all batch decode rounds: (R, N, 1, half_dim).
+    batch_precomputed_cos: Option<Tensor>,
+    /// Precomputed M-RoPE sin for all batch decode rounds: (R, N, 1, half_dim).
+    batch_precomputed_sin: Option<Tensor>,
+    /// Current round index into precomputed M-RoPE tensors.
+    batch_rope_round: usize,
 }
 
 impl Qwen3VLBackend {
@@ -490,6 +497,9 @@ impl Qwen3VLBackend {
             current_gen_pos: None,
             current_prefill_len: None,
             batch_gen_positions: Vec::new(),
+            batch_precomputed_cos: None,
+            batch_precomputed_sin: None,
+            batch_rope_round: 0,
         }
     }
 }
@@ -591,8 +601,37 @@ impl ModelBackend for Qwen3VLBackend {
         }
     }
 
-    fn set_batch_vlm_positions(&mut self, positions: &[(i64, usize)]) {
+    fn set_batch_vlm_positions(&mut self, positions: &[(i64, usize)], num_rounds: usize) {
         self.batch_gen_positions = positions.iter().map(|(gp, _)| *gp).collect();
+        self.batch_rope_round = 0;
+
+        // Precompute M-RoPE cos/sin for all decode rounds at once.
+        // During decode, all 3 dims (temporal, height, width) use the same gen_pos.
+        // Layout: (3, N*R) → MRoPE → (N*R, half_dim) → reshape (R, N, 1, half_dim).
+        let n = self.batch_gen_positions.len();
+        let nr = n * num_rounds;
+        let device = &self.model.device;
+
+        let mut pos_data: Vec<i64> = Vec::with_capacity(3 * nr);
+        for _ in 0..3 {
+            for round in 0..num_rounds {
+                for &gp in &self.batch_gen_positions {
+                    pos_data.push(gp + round as i64);
+                }
+            }
+        }
+
+        let pos_all = Tensor::from_vec(pos_data, (3, nr), device).unwrap();
+        let (cos, sin) = self.model.mrope().forward(&pos_all).unwrap();
+        let half_dim = cos.dim(1).unwrap();
+        self.batch_precomputed_cos = Some(
+            cos.reshape((num_rounds, n, half_dim)).unwrap()
+                .unsqueeze(2).unwrap()
+        );
+        self.batch_precomputed_sin = Some(
+            sin.reshape((num_rounds, n, half_dim)).unwrap()
+                .unsqueeze(2).unwrap()
+        );
     }
 
     // ── Batch decode ──
@@ -616,34 +655,24 @@ impl ModelBackend for Qwen3VLBackend {
         attention_mask: Option<&Tensor>,
         batch_kv_info: Option<(&[usize], usize)>,
     ) -> candle_core::Result<Tensor> {
-        // Build M-RoPE 3D positions from batch_gen_positions.
-        // During decode all 3 dims (temporal, height, width) use the same gen_pos.
-        // Tensor shape is (3, N) row-major: [all_temporal, all_height, all_width].
-        let n = self.batch_gen_positions.len();
-        let device = &self.model.device;
-        let pos_data: Vec<i64> = (0..3)
-            .flat_map(|_| self.batch_gen_positions.iter().copied())
-            .collect();
-        let pos_3d = Tensor::from_vec(pos_data, (3, n), device)?;
-        let (cos, sin) = self.model.mrope().forward(&pos_3d)?;
-        // cos/sin are [N, half_dim], need [N, 1, half_dim] for attention
-        let cos = cos.unsqueeze(1)?;
-        let sin = sin.unsqueeze(1)?;
+        // Index precomputed M-RoPE cos/sin for the current round.
+        // All rounds were precomputed in set_batch_vlm_positions().
+        let round = self.batch_rope_round;
+        let cos = self.batch_precomputed_cos.as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("M-RoPE not precomputed".into()))?
+            .narrow(0, round, 1)?.squeeze(0)?;
+        let sin = self.batch_precomputed_sin.as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("M-RoPE not precomputed".into()))?
+            .narrow(0, round, 1)?.squeeze(0)?;
+        self.batch_rope_round += 1;
 
-        let logits = self.model.decoder_mut().step_batch_decode(
+        self.model.decoder_mut().step_batch_decode(
             input_ids,
             &cos,
             &sin,
             attention_mask,
             batch_kv_info,
-        )?;
-
-        // Auto-increment gen positions for next round.
-        for gp in &mut self.batch_gen_positions {
-            *gp += 1;
-        }
-
-        Ok(logits)
+        )
     }
 
     fn extract_batch_kv(

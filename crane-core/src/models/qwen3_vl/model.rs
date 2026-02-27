@@ -752,11 +752,11 @@ impl TextAttention {
         if self.num_kv_groups > 1 && seq_len == 1 {
             let scale = 1.0 / (self.head_dim as f64).sqrt();
 
-            // Batch decode with per-sequence attention: each sequence computes
-            // attention over ONLY its real KV data (no padding) to handle
-            // different-length KV caches correctly.
+            // Batch decode: when KV lengths differ, use per-sequence attention
+            // over only real data (no padding). When all equal, fall through
+            // to the fast batched GQA path below.
             if let Some((kv_lens, original_max_kv)) = batch_kv_info {
-                if b > 1 {
+                if b > 1 && kv_lens.iter().any(|&l| l != original_max_kv) {
                     let rounds_done = self.cache_seq_len - original_max_kv;
                     let mut outputs = Vec::with_capacity(b);
                     for i in 0..b {
@@ -781,7 +781,7 @@ impl TextAttention {
                 }
             }
 
-            // Sequential decode (b=1): standard path, no mask needed
+            // Fast batched GQA: b=1, or batch with equal kv_lens (no padding)
             let q_g = (q.reshape((b, self.num_kv_heads, self.num_kv_groups, self.head_dim))? * scale)?;
             let k_t = k.transpose(2, 3)?.contiguous()?;
             let attn = q_g.contiguous()?.matmul(&k_t)?;
@@ -1278,8 +1278,7 @@ impl TextDecoder {
             )?;
 
             if let Some((k, v)) = batched_kv {
-                let k = k.contiguous()?;
-                let v = v.contiguous()?;
+                // k, v already contiguous from pad_and_stack_kv_caches.
                 if extra_room > 0 {
                     let (b, h, s, d) = k.dims4()?;
                     let buf_k =

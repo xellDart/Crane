@@ -1035,18 +1035,22 @@ impl InferenceEngine {
 
         let t_setup = t0.elapsed();
 
-        // Pre-build attention mask.
+        // Pre-build attention mask (VLM uses per-sequence attention, no mask needed).
         let max_total_width = original_max_kv + self.decode_tokens_per_seq;
-        let full_mask = match self.model.build_batch_decode_mask(
-            &kv_lens,
-            original_max_kv,
-            max_total_width,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                error!("Mask build failed: {e}");
-                self.model.clear_kv_cache();
-                return;
+        let full_mask = if self.model.is_vlm() {
+            None
+        } else {
+            match self.model.build_batch_decode_mask(
+                &kv_lens,
+                original_max_kv,
+                max_total_width,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Mask build failed: {e}");
+                    self.model.clear_kv_cache();
+                    return;
+                }
             }
         };
 
@@ -1067,7 +1071,7 @@ impl InferenceEngine {
             .map(|id| *self.sequences.get(id).unwrap().tokens.last().unwrap())
             .collect();
 
-        // VLM: set per-sequence M-RoPE generation positions for batch decode.
+        // VLM: precompute per-sequence M-RoPE positions for all batch decode rounds.
         if self.model.is_vlm() {
             let vlm_positions: Vec<(i64, usize)> = batch.iter().map(|id| {
                 let seq = self.sequences.get(id).unwrap();
@@ -1075,7 +1079,7 @@ impl InferenceEngine {
                     .map(|vs| (vs.next_gen_pos, vs.prefill_len))
                     .unwrap_or((seq.start_pos() as i64, seq.prompt_len))
             }).collect();
-            self.model.set_batch_vlm_positions(&vlm_positions);
+            self.model.set_batch_vlm_positions(&vlm_positions, self.decode_tokens_per_seq);
         }
 
         for round in 0..self.decode_tokens_per_seq {
@@ -1195,12 +1199,12 @@ impl InferenceEngine {
                 .model
                 .extract_batch_kv(&kv_lens, original_max_kv, rounds_done)
             {
-                Ok(extracted) => {
+                Ok(mut extracted) => {
                     for (i, seq_id) in batch.iter().enumerate() {
                         if alive[i] {
                             if let Some(seq) = self.sequences.get_mut(seq_id) {
                                 if i < extracted.len() {
-                                    seq.kv_caches = extracted[i].clone();
+                                    seq.kv_caches = std::mem::take(&mut extracted[i]);
                                 }
                             }
                         }
