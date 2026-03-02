@@ -152,6 +152,35 @@ pub trait ModelBackend: Send + 'static {
     /// Each entry is (gen_pos, prefill_len). `num_rounds` is the number of decode rounds.
     /// Only used by VLM backends with batch decode.
     fn set_batch_vlm_positions(&mut self, _positions: &[(i64, usize)], _num_rounds: usize) {}
+
+    // ── GDN recurrent state (hybrid linear-attention models) ──────────────
+
+    /// Extract single-sequence (B=1) GDN states from the model after prefill.
+    /// Returns per-layer `(recurrent_state, conv_state)` pairs.
+    /// Returns an empty vec for non-hybrid models.
+    fn extract_single_gdn_states(&mut self) -> Vec<Option<(Tensor, Tensor)>> {
+        vec![]
+    }
+
+    /// Restore per-sequence GDN states into the model for batch decode.
+    /// `states[i]` is the GDN state for sequence `i`.
+    /// No-op for non-hybrid models.
+    fn restore_batch_gdn_states(
+        &mut self,
+        _states: &[Vec<Option<(Tensor, Tensor)>>],
+    ) -> candle_core::Result<()> {
+        Ok(())
+    }
+
+    /// Extract per-sequence GDN states from a batch after decode rounds.
+    /// Must be called BEFORE `extract_batch_kv` (which clears linear layer state).
+    /// Returns `[n_seqs][n_layers]` states. Returns empty for non-hybrid models.
+    fn extract_batch_gdn_states(
+        &mut self,
+        _n_seqs: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        Ok(vec![])
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -632,6 +661,26 @@ impl ModelBackend for Qwen3VLBackend {
             sin.reshape((num_rounds, n, half_dim)).unwrap()
                 .unsqueeze(2).unwrap()
         );
+    }
+
+    // ── GDN recurrent state ──
+
+    fn extract_single_gdn_states(&mut self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.model.decoder_mut().extract_single_gdn_states()
+    }
+
+    fn restore_batch_gdn_states(
+        &mut self,
+        states: &[Vec<Option<(Tensor, Tensor)>>],
+    ) -> candle_core::Result<()> {
+        self.model.decoder_mut().restore_batch_gdn_states(states)
+    }
+
+    fn extract_batch_gdn_states(
+        &mut self,
+        n_seqs: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        self.model.decoder_mut().extract_batch_gdn_states(n_seqs)
     }
 
     // ── Batch decode ──

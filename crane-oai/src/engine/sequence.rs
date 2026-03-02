@@ -54,6 +54,12 @@ pub struct Sequence {
     /// Each element is `(K, V)` for a layer, or `None` for fresh layers.
     pub kv_caches: Vec<Option<(Tensor, Tensor)>>,
 
+    // ── GDN recurrent states (hybrid models only) ──
+    /// Per-layer GDN (linear attention) recurrent and conv states.
+    /// Each element is `(recurrent_state, conv_state)` for a linear layer,
+    /// or `None` for full-attention layers or when not yet initialized.
+    pub gdn_states: Vec<Option<(Tensor, Tensor)>>,
+
     // ── sampling ──
     pub logits_processor: LogitsProcessor,
     pub temperature: Option<f64>,
@@ -151,6 +157,7 @@ mod tests {
             tokens,
             prompt_len: prompt.len(),
             kv_caches: vec![],
+            gdn_states: vec![],
             logits_processor: LogitsProcessor::new(42, Some(0.8), Some(0.95)),
             temperature: Some(0.8),
             top_p: Some(0.95),

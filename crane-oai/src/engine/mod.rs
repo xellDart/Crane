@@ -703,6 +703,7 @@ impl InferenceEngine {
             tokens: req.tokens,
             prompt_len,
             kv_caches: vec![None; self.num_layers],
+            gdn_states: vec![],
             logits_processor: candle_transformers::generation::LogitsProcessor::new(
                 sampling::rand_seed(),
                 req.temperature,
@@ -899,6 +900,17 @@ impl InferenceEngine {
             });
         }
 
+        // Save GDN recurrent states for hybrid models (e.g. Qwen3.5).
+        // Must be done before clear_kv_cache() erases them on next prefill.
+        {
+            let gdn = self.model.extract_single_gdn_states();
+            if !gdn.is_empty() {
+                if let Some(seq) = self.sequences.get_mut(&seq_id) {
+                    seq.gdn_states = gdn;
+                }
+            }
+        }
+
         self.stats
             .total_prompt_tokens
             .fetch_add(prefill_len as u64, Ordering::Relaxed);
@@ -992,8 +1004,14 @@ impl InferenceEngine {
         if let Some(ref prev_id) = self.active_seq_id.take() {
             if self.sequences.contains_key(prev_id) {
                 let caches = self.model.get_kv_caches();
+                // Also save GDN recurrent states (hybrid models: may have been
+                // updated by sequential decode steps since prefill).
+                let gdn = self.model.extract_single_gdn_states();
                 if let Some(seq) = self.sequences.get_mut(prev_id) {
                     seq.kv_caches = caches;
+                    if !gdn.is_empty() {
+                        seq.gdn_states = gdn;
+                    }
                 }
             }
             self.model.clear_kv_cache();
@@ -1030,6 +1048,21 @@ impl InferenceEngine {
         for seq_id in &batch {
             if let Some(seq) = self.sequences.get_mut(seq_id) {
                 seq.kv_caches = vec![None; self.num_layers];
+            }
+        }
+
+        // Restore GDN recurrent states for hybrid models (e.g. Qwen3.5).
+        // Must be done after setup_batch_decode and before the decode loop.
+        {
+            let gdn_states: Vec<Vec<Option<(Tensor, Tensor)>>> = batch
+                .iter()
+                .map(|id| self.sequences.get(id).unwrap().gdn_states.clone())
+                .collect();
+            let any_non_none = gdn_states.iter().any(|s| s.iter().any(|g| g.is_some()));
+            if any_non_none {
+                if let Err(e) = self.model.restore_batch_gdn_states(&gdn_states) {
+                    error!("Failed to restore batch GDN states: {e}");
+                }
             }
         }
 
@@ -1193,8 +1226,18 @@ impl InferenceEngine {
             }
         }
 
-        // Extract per-sequence KV caches.
+        // Extract per-sequence KV caches (and GDN states for hybrid models).
         if rounds_done > 0 {
+            // Extract GDN states FIRST — extract_batch_kv clears linear layer state.
+            let mut gdn_extracted: Vec<Vec<Option<(Tensor, Tensor)>>> =
+                match self.model.extract_batch_gdn_states(batch_size) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        error!("GDN state extraction failed: {e}");
+                        vec![]
+                    }
+                };
+
             match self
                 .model
                 .extract_batch_kv(&kv_lens, original_max_kv, rounds_done)
@@ -1205,6 +1248,9 @@ impl InferenceEngine {
                             if let Some(seq) = self.sequences.get_mut(seq_id) {
                                 if i < extracted.len() {
                                     seq.kv_caches = std::mem::take(&mut extracted[i]);
+                                }
+                                if i < gdn_extracted.len() {
+                                    seq.gdn_states = std::mem::take(&mut gdn_extracted[i]);
                                 }
                             }
                         }
@@ -1400,6 +1446,8 @@ impl InferenceEngine {
         // Save previous active sequence's KV cache (and VLM state) from the model.
         if let Some(ref prev_id) = self.active_seq_id.clone() {
             let caches = self.model.get_kv_caches();
+            // Save GDN recurrent states (hybrid models).
+            let gdn = self.model.extract_single_gdn_states();
             // Save VLM decode state from model into sequence.
             if let Some(vlm_decode) = self.model.get_vlm_decode_state() {
                 if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
@@ -1410,6 +1458,9 @@ impl InferenceEngine {
             }
             if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
                 prev_seq.kv_caches = caches;
+                if !gdn.is_empty() {
+                    prev_seq.gdn_states = gdn;
+                }
             }
         }
 
@@ -1420,6 +1471,20 @@ impl InferenceEngine {
             .map(|s| s.kv_caches.clone())
             .unwrap_or_else(|| vec![None; self.num_layers]);
         self.model.set_kv_caches(caches);
+
+        // Restore GDN recurrent states for the new sequence (hybrid models).
+        {
+            let gdn = self
+                .sequences
+                .get(seq_id)
+                .map(|s| s.gdn_states.clone())
+                .unwrap_or_default();
+            if !gdn.is_empty() {
+                if let Err(e) = self.model.restore_batch_gdn_states(&[gdn]) {
+                    error!("GDN state restore failed during swap_in: {e}");
+                }
+            }
+        }
 
         // Restore VLM decode state into model.
         if let Some(seq) = self.sequences.get(seq_id) {

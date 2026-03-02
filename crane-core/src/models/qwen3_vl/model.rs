@@ -20,6 +20,20 @@ fn rms_norm(size: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<RmsNor
     Ok(RmsNorm::new(w, eps))
 }
 
+/// Qwen3.5 uses `(1 + weight) * x_normalized` (weights trained from zero-init).
+/// This helper loads the weight and pre-adds 1 so standard RmsNorm gives the right result.
+fn rms_norm_qwen35(size: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<RmsNorm> {
+    let w = vb.get_with_hints(size, "weight", candle_nn::Init::Const(0.))?;
+    let w = w.affine(1.0, 1.0)?; // stored_weight + 1
+    Ok(RmsNorm::new(w, eps))
+}
+
+/// Load a raw layernorm weight tensor; for Qwen3.5 add 1 to match the (1+w) parameterization.
+fn ln_weight_for_cfg(size: usize, cfg: &TextConfig, vb: VarBuilder) -> candle_core::Result<Tensor> {
+    let w = vb.get_with_hints(size, "weight", candle_nn::Init::Const(1.))?;
+    if cfg.is_hybrid() { w.affine(1.0, 1.0) } else { Ok(w) }
+}
+
 // ── Config ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,12 +75,89 @@ pub struct TextConfig {
     pub head_dim: usize,
     pub max_position_embeddings: usize,
     pub rms_norm_eps: f64,
-    pub rope_theta: f64,
+    // Direct field (qwen3-vl) or nested in rope_parameters (qwen3.5)
+    #[serde(default)]
+    pub rope_theta: Option<f64>,
+    #[serde(default)]
+    pub rope_parameters: Option<RopeParameters>,
     #[serde(default)]
     pub tie_word_embeddings: bool,
     #[serde(default)]
     pub rope_scaling: Option<RopeScaling>,
+    // Hybrid architecture fields (qwen3.5 — absent in qwen3-vl)
+    #[serde(default)]
+    pub layer_types: Vec<String>,
+    #[serde(default = "default_linear_num_heads")]
+    pub linear_num_key_heads: usize,
+    #[serde(default = "default_linear_num_heads")]
+    pub linear_num_value_heads: usize,
+    #[serde(default = "default_linear_head_dim")]
+    pub linear_key_head_dim: usize,
+    #[serde(default = "default_linear_head_dim")]
+    pub linear_value_head_dim: usize,
+    #[serde(default = "default_conv_kernel_dim")]
+    pub linear_conv_kernel_dim: usize,
+    // Gated output for full-attention layers (qwen3.5)
+    #[serde(default)]
+    pub attn_output_gate: bool,
 }
+
+impl TextConfig {
+    pub fn rope_theta(&self) -> f64 {
+        self.rope_theta
+            .or_else(|| self.rope_parameters.as_ref().map(|p| p.rope_theta))
+            .unwrap_or(1_000_000.0)
+    }
+
+    /// Number of head dimensions that receive rotary position embeddings.
+    /// For Qwen3.5: head_dim * partial_rotary_factor (e.g. 256 * 0.25 = 64).
+    /// For Qwen3-VL: head_dim (full rotation).
+    pub fn rope_dim(&self) -> usize {
+        let factor = self.rope_parameters.as_ref()
+            .map(|p| p.partial_rotary_factor)
+            .unwrap_or(1.0);
+        ((self.head_dim as f64 * factor).round() as usize).max(2)
+    }
+
+    /// mrope_section — from rope_parameters (Qwen3.5) or rope_scaling (Qwen3-VL).
+    pub fn rope_mrope_section(&self) -> Vec<usize> {
+        if let Some(ref p) = self.rope_parameters {
+            if !p.mrope_section.is_empty() {
+                return p.mrope_section.clone();
+            }
+        }
+        if let Some(ref s) = self.rope_scaling {
+            if !s.mrope_section.is_empty() {
+                return s.mrope_section.clone();
+            }
+        }
+        vec![24, 20, 20] // default for Qwen3-VL-2B
+    }
+
+    /// Whether this config uses the hybrid GDN/full-attention architecture.
+    pub fn is_hybrid(&self) -> bool {
+        !self.layer_types.is_empty()
+    }
+
+    pub fn layer_type(&self, i: usize) -> &str {
+        if self.layer_types.is_empty() {
+            "full_attention"
+        } else {
+            &self.layer_types[i]
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RopeParameters {
+    pub rope_theta: f64,
+    #[serde(default)]
+    pub mrope_section: Vec<usize>,
+    #[serde(default = "default_partial_rotary_factor")]
+    pub partial_rotary_factor: f64,
+}
+
+fn default_partial_rotary_factor() -> f64 { 1.0 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeScaling {
@@ -77,6 +168,9 @@ pub struct RopeScaling {
 }
 
 fn default_head_dim() -> usize { 128 }
+fn default_linear_num_heads() -> usize { 16 }
+fn default_linear_head_dim() -> usize { 128 }
+fn default_conv_kernel_dim() -> usize { 4 }
 
 // ── Vision: Patch Embedding ──────────────────────────────────────────
 
@@ -543,17 +637,15 @@ pub struct MRoPE {
 
 impl MRoPE {
     pub fn new(cfg: &TextConfig, device: &Device, dtype: DType) -> candle_core::Result<Self> {
-        let dim = cfg.head_dim;
-        let theta = cfg.rope_theta;
-        let half_dim = dim / 2;
+        let rope_dim = cfg.rope_dim(); // partial_rotary_factor applied (64 for qwen3.5)
+        let theta    = cfg.rope_theta();
+        let half_dim = rope_dim / 2;  // 32 for qwen3.5, 64 for qwen3-vl
         let inv_freq: Vec<f32> = (0..half_dim)
-            .map(|i| 1.0 / theta.powf(2.0 * i as f64 / dim as f64) as f32)
+            .map(|i| 1.0 / theta.powf(2.0 * i as f64 / rope_dim as f64) as f32)
             .collect();
         let inv_freq = Tensor::from_vec(inv_freq, half_dim, device)?;
 
-        let mrope_section = cfg.rope_scaling.as_ref()
-            .map(|s| s.mrope_section.clone())
-            .unwrap_or_else(|| vec![24, 20, 20]);
+        let mrope_section = cfg.rope_mrope_section(); // [11,11,10] for qwen3.5
 
         Ok(Self { inv_freq, mrope_section, dtype })
     }
@@ -571,44 +663,391 @@ impl MRoPE {
         let h_pos = position_ids.i(1)?.to_vec1::<i64>()?; // height
         let w_pos = position_ids.i(2)?.to_vec1::<i64>()?; // width
 
-        let min_section = *sections.iter().min().unwrap(); // 20
+        let min_section = *sections.iter().min().unwrap(); // 10 for [11,11,10]; 20 for [24,20,20]
 
-        // Build interleaved frequency table matching HF's apply_interleaved_mrope:
-        //
-        // HF computes: freqs[d, s, f] = inv_freq[f] * position[d, s]
-        // Then interleaves: output[s, f] picks from T/H/W based on f's position:
-        //   f % 3 == 0 → T (temporal)  for f < min_section*3
-        //   f % 3 == 1 → H (height)   for f < min_section*3
-        //   f % 3 == 2 → W (width)    for f < min_section*3
-        //   f >= min_section*3 → T (remaining temporal frequencies)
-        //
-        // Each output[s, f] = inv_freq[f] * position_of_assigned_dim[s]
+        // Build interleaved frequency table matching HF apply_multimodal_rotary_pos_emb.
+        // Layout: for each of the min_section rounds, one T freq, one H freq, one W freq
+        // (interleaved [T,H,W,T,H,W,...]).  After that, any excess per section in order T, H, W.
         let mut output = vec![vec![0f32; half_dim]; seq_len];
-        let interleaved_end = min_section * 3; // 60
+        let interleaved_end = min_section * 3;
+
+        // positions per dimension [T, H, W]
+        let dim_names = [&t_pos, &h_pos, &w_pos];
 
         for s in 0..seq_len {
             let tp = t_pos[s] as f32;
             let hp = h_pos[s] as f32;
             let wp = w_pos[s] as f32;
+            let dim_pos = [tp, hp, wp];
 
-            // Interleaved region: [T,H,W,T,H,W,...] each using its own inv_freq[f]
+            // Interleaved region: [T, H, W, T, H, W, ...]
             for i in 0..min_section {
                 let base = i * 3;
-                output[s][base]     = tp * inv_freq_vec[base];     // T at inv_freq[base]
-                output[s][base + 1] = hp * inv_freq_vec[base + 1]; // H at inv_freq[base+1]
-                output[s][base + 2] = wp * inv_freq_vec[base + 2]; // W at inv_freq[base+2]
+                output[s][base]     = dim_pos[0] * inv_freq_vec[base];
+                output[s][base + 1] = dim_pos[1] * inv_freq_vec[base + 1];
+                output[s][base + 2] = dim_pos[2] * inv_freq_vec[base + 2];
             }
 
-            // Remaining temporal frequencies (indices 60..63)
-            for f in interleaved_end..half_dim {
-                output[s][f] = tp * inv_freq_vec[f];
+            // Remaining (extra) frequencies per dimension in order T, H, W
+            let mut f = interleaved_end;
+            for (d, &sec_len) in sections.iter().enumerate() {
+                for _ in 0..(sec_len - min_section) {
+                    output[s][f] = dim_pos[d] * inv_freq_vec[f];
+                    f += 1;
+                }
             }
+            // f should now equal half_dim
         }
+        let _ = dim_names; // suppress unused-variable warning
 
         let output = Tensor::new(output, device)?; // (seq_len, half_dim)
         let cos = output.cos()?.to_dtype(self.dtype)?;
         let sin = output.sin()?.to_dtype(self.dtype)?;
         Ok((cos, sin))
+    }
+}
+
+// ── Text: Helpers for GDN ────────────────────────────────────────────
+
+/// L2-normalize `x` along its last dimension (per-head unit norm).
+fn l2_normalize(x: &Tensor) -> candle_core::Result<Tensor> {
+    let norm = x.sqr()?.sum_keepdim(D::Minus1)?.clamp(1e-12_f64, f64::MAX)?.sqrt()?;
+    x.broadcast_div(&norm)
+}
+
+/// Element-wise softplus: log(1 + exp(x)).
+fn softplus(x: &Tensor) -> candle_core::Result<Tensor> {
+    // softplus(x) = log(1 + exp(x))
+    // Numerically stable: max(x,0) + log(1 + exp(-|x|))
+    //   = max(x,0) + log(exp(-|x|) + 1)
+    let pos   = x.clamp(0.0_f64, f64::MAX)?;
+    let abs_x = x.abs()?;
+    // log(exp(-|x|) + 1): since exp(-|x|) in (0,1], this is safe
+    let inner     = abs_x.neg()?.exp()?.add(&Tensor::ones_like(&abs_x)?)?;
+    let log_inner = inner.log()?;
+    pos.add(&log_inner)
+}
+
+// ── Text: Gated Delta Network (linear attention) ─────────────────────
+
+/// RMSNorm with a SiLU gate applied to the output: `rms_norm(x) * silu(gate)`.
+struct RmsNormGated {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RmsNormGated {
+    fn new(size: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<Self> {
+        let weight = vb.get_with_hints(size, "weight", candle_nn::Init::Const(1.))?;
+        Ok(Self { weight, eps })
+    }
+
+    fn forward(&self, x: &Tensor, gate: &Tensor) -> candle_core::Result<Tensor> {
+        // x, gate: (..., size)
+        let x = x.to_dtype(DType::F32)?;
+        let gate = gate.to_dtype(DType::F32)?;
+        let var = x.sqr()?.mean_keepdim(D::Minus1)?;
+        let x_norm = x.broadcast_div(&(var + self.eps)?.sqrt()?)?;
+        let x_scaled = x_norm.broadcast_mul(&self.weight.to_dtype(DType::F32)?)?;
+        // SiLU gate: x * sigmoid(x)
+        let g = candle_nn::Activation::Silu.forward(&gate)?;
+        x_scaled.mul(&g)?.to_dtype(self.weight.dtype())
+    }
+}
+
+/// Gated Delta Network — the linear-attention layer in Qwen3.5.
+///
+/// Weights (per layer):
+///   linear_attn.in_proj_qkv  (key_dim + key_dim + value_dim, hidden)
+///   linear_attn.in_proj_z    (value_dim, hidden)
+///   linear_attn.in_proj_b    (num_heads, hidden)
+///   linear_attn.in_proj_a    (num_heads, hidden)
+///   linear_attn.conv1d.weight (conv_dim, 1, kernel_size)
+///   linear_attn.A_log        (num_heads,)
+///   linear_attn.dt_bias      (num_heads,)
+///   linear_attn.norm.weight  (head_v_dim,)
+///   linear_attn.out_proj     (hidden, value_dim)
+struct GatedDeltaNet {
+    in_proj_qkv: Linear,
+    in_proj_z:   Linear,
+    in_proj_b:   Linear,
+    in_proj_a:   Linear,
+    conv1d_w:    Tensor,   // (conv_dim, kernel_size) — squeezed from (conv_dim, 1, ks)
+    a_log:       Tensor,   // (num_heads,)
+    dt_bias:     Tensor,   // (num_heads,)
+    norm:        RmsNormGated,
+    out_proj:    Linear,
+    // dims
+    num_heads:  usize,
+    key_dim:    usize,
+    value_dim:  usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    conv_ks:    usize,
+    conv_dim:   usize,
+    // decode state
+    conv_state:      Option<Tensor>, // (B, conv_dim, conv_ks - 1)
+    recurrent_state: Option<Tensor>, // (B, num_heads, head_k_dim, head_v_dim)
+}
+
+impl GatedDeltaNet {
+    fn new(cfg: &TextConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        let h    = cfg.hidden_size;
+        let nkh  = cfg.linear_num_key_heads;
+        let nvh  = cfg.linear_num_value_heads;
+        let hkd  = cfg.linear_key_head_dim;
+        let hvd  = cfg.linear_value_head_dim;
+        let ks   = cfg.linear_conv_kernel_dim;
+        let kd   = nkh * hkd;   // key_dim  = 2048
+        let vd   = nvh * hvd;   // value_dim = 2048
+        let conv_dim = kd + kd + vd;  // 6144
+
+        let in_proj_qkv = linear_no_bias(h, conv_dim, vb.pp("in_proj_qkv"))?;
+        let in_proj_z   = linear_no_bias(h, vd,       vb.pp("in_proj_z"))?;
+        // in_proj_b / in_proj_a output num_heads scalars (not per-head-dim vectors)
+        let in_proj_b = linear_no_bias(h, nvh, vb.pp("in_proj_b"))?;
+        let in_proj_a = linear_no_bias(h, nvh, vb.pp("in_proj_a"))?;
+
+        let conv1d_raw = vb.get((conv_dim, 1, ks), "conv1d.weight")?;
+        let conv1d_w   = conv1d_raw.reshape((conv_dim, ks))?;
+
+        let a_log   = vb.get(nvh, "A_log")?;
+        let dt_bias = vb.get(nvh, "dt_bias")?;
+
+        let norm     = RmsNormGated::new(hvd, cfg.rms_norm_eps, vb.pp("norm"))?;
+        let out_proj = linear_no_bias(vd, h, vb.pp("out_proj"))?;
+
+        Ok(Self {
+            in_proj_qkv, in_proj_z, in_proj_b, in_proj_a,
+            conv1d_w, a_log, dt_bias, norm, out_proj,
+            num_heads: nvh, key_dim: kd, value_dim: vd,
+            head_k_dim: hkd, head_v_dim: hvd,
+            conv_ks: ks, conv_dim,
+            conv_state: None, recurrent_state: None,
+        })
+    }
+
+    /// Apply depthwise causal conv1d to `x: (B, T, C)` → `(B, T, C)` with SiLU.
+    /// Uses `self.conv_state` as left-padding during prefill/decode.
+    fn apply_conv1d(&self, x: &Tensor, is_decode: bool) -> candle_core::Result<Tensor> {
+        let (b, t, c) = x.dims3()?;
+        let ks = self.conv_ks;
+        // Transpose to (B, C, T)
+        let x_t = x.transpose(1, 2)?;
+
+        // Pad left with zeros (prefill always) or with stored conv_state (decode only).
+        // During prefill conv_state may already be set (we save input before calling this),
+        // but we must NOT use it as padding — prefill always uses causal zero-padding.
+        let pad = if is_decode {
+            match &self.conv_state {
+                Some(s) => s.clone(),
+                None => Tensor::zeros((b, c, ks - 1), x_t.dtype(), x_t.device())?,
+            }
+        } else {
+            Tensor::zeros((b, c, ks - 1), x_t.dtype(), x_t.device())?
+        };
+
+        let x_padded = Tensor::cat(&[&pad, &x_t], 2)?; // (B, C, T + ks - 1)
+
+        // Vectorised depthwise conv: for each pos, element-wise mul with kernel, sum over ks.
+        // Window shape for all T positions: stack as (B, C, T, ks), then reduce.
+        let windows: candle_core::Result<Vec<Tensor>> = (0..t)
+            .map(|i| x_padded.narrow(2, i, ks))
+            .collect();
+        let windows = windows?;
+        let stacked = Tensor::stack(&windows, 2)?; // (B, C, T, ks)
+        let w = self.conv1d_w.to_dtype(stacked.dtype())?;
+        // w: (C, ks) → broadcast to (1, C, 1, ks)
+        let w = w.unsqueeze(0)?.unsqueeze(2)?;
+        let out = stacked.broadcast_mul(&w)?.sum(D::Minus1)?; // (B, C, T)
+
+        // SiLU
+        let out = candle_nn::Activation::Silu.forward(&out)?;
+        out.transpose(1, 2) // (B, T, C)
+    }
+
+    /// Update the conv sliding-window state from the conv INPUT `x_input: (B, C, T)`.
+    ///
+    /// Prefill: stores the last `conv_ks - 1` input tokens (zero-padded if T < ks-1).
+    /// Decode:  shifts the existing state left by 1 and appends the new token (x_input is (B,C,1)),
+    ///          so the window always covers the last `ks-1` input tokens seen so far.
+    fn update_conv_state(&mut self, x_input: &Tensor, t: usize, is_decode: bool) -> candle_core::Result<()> {
+        let need = self.conv_ks - 1;
+        let state = if is_decode {
+            // Decode (t=1): shift existing state [old[1:], new_tok]
+            match &self.conv_state {
+                Some(s) => {
+                    if need <= 1 {
+                        x_input.clone()
+                    } else {
+                        // s: (B, C, need); drop oldest token, append new
+                        let tail = s.narrow(2, 1, need - 1)?;
+                        Tensor::cat(&[&tail, x_input], 2)?
+                    }
+                }
+                None => {
+                    // First decode without prior state (shouldn't happen in normal flow,
+                    // but handle gracefully by zero-padding on the left)
+                    if need <= 1 {
+                        x_input.clone()
+                    } else {
+                        let (b, c, _) = x_input.dims3()?;
+                        let pad = Tensor::zeros((b, c, need - 1), x_input.dtype(), x_input.device())?;
+                        Tensor::cat(&[&pad, x_input], 2)?
+                    }
+                }
+            }
+        } else {
+            // Prefill: store last `need` input tokens (zero-pad if T < need)
+            if t >= need {
+                x_input.narrow(2, t - need, need)?
+            } else {
+                let (b, c, _) = x_input.dims3()?;
+                let pad = Tensor::zeros((b, c, need - t), x_input.dtype(), x_input.device())?;
+                Tensor::cat(&[&pad, x_input], 2)?
+            }
+        };
+        self.conv_state = Some(state);
+        Ok(())
+    }
+
+    /// Single-step recurrent GDN update.  All inputs are (B, num_heads, head_dim).
+    /// Returns `(output (B, num_heads, head_v_dim), new_state)`.
+    fn recurrent_step(
+        &self,
+        state: &Tensor,          // (B, H, Hk, Hv)
+        q: &Tensor,              // (B, H, Hk)  — L2-normalised & scaled
+        k: &Tensor,              // (B, H, Hk)  — L2-normalised
+        v: &Tensor,              // (B, H, Hv)
+        g_exp: &Tensor,          // (B, H)  — exp(decay), >= 0
+        beta: &Tensor,           // (B, H)  — sigmoid(b), in [0,1]
+    ) -> candle_core::Result<(Tensor, Tensor)> {
+        let g4d    = g_exp.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?; // (B,H,1,1)
+        let beta2d = beta.unsqueeze(D::Minus1)?;                         // (B,H,1)
+
+        // Decay state first (matches HF torch_recurrent_gated_delta_rule)
+        let state = state.broadcast_mul(&g4d)?; // S = S * g
+
+        // kv_pred = S · k  (prediction uses DECAYED state)
+        let kv_pred = state.broadcast_mul(&k.unsqueeze(D::Minus1)?)?.sum(D::Minus2)?;
+
+        // delta = (v - kv_pred) * beta  (B,H,Hv)
+        let delta = v.sub(&kv_pred)?.broadcast_mul(&beta2d)?;
+
+        // outer(k, delta): (B,H,Hk,1) × (B,H,1,Hv) → (B,H,Hk,Hv)
+        let outer = k.unsqueeze(D::Minus1)?.broadcast_mul(&delta.unsqueeze(D::Minus2)?)?;
+        let new_state = state.add(&outer)?;
+
+        // out = S_new · q:  (B,H,Hk,Hv) × q(B,H,Hk,1) → sum dim 2 → (B,H,Hv)
+        let out = new_state.broadcast_mul(&q.unsqueeze(D::Minus1)?)?.sum(D::Minus2)?;
+
+        Ok((out, new_state))
+    }
+
+    fn forward(&mut self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        let (b, t, _) = xs.dims3()?;
+        let is_decode = self.recurrent_state.is_some() && t == 1;
+
+        // ── 1. Projections ────────────────────────────────────────────
+        let qkv = self.in_proj_qkv.forward(xs)?;  // (B, T, conv_dim)
+        let z   = self.in_proj_z.forward(xs)?;     // (B, T, value_dim)
+        let b_proj = self.in_proj_b.forward(xs)?;  // (B, T, num_heads)
+        let a_proj = self.in_proj_a.forward(xs)?;  // (B, T, num_heads)
+
+        // ── 2. Causal conv1d + SiLU ───────────────────────────────────
+        // Transpose to (B, C, T) before updating/using the conv state.
+        let qkv_input_t = qkv.transpose(1, 2)?.contiguous()?; // (B, C, T) — pre-conv input
+
+        // Apply conv FIRST using the OLD conv state as left-padding (decode),
+        // or zero-padding (prefill).  Must come before state update.
+        let qkv = self.apply_conv1d(&qkv, is_decode)?;  // (B, T, conv_dim)
+
+        // Now update the conv state with the new input tokens.
+        self.update_conv_state(&qkv_input_t, t, is_decode)?;
+
+        // ── 3. Split Q, K, V ─────────────────────────────────────────
+        let q = qkv.narrow(2, 0,                       self.key_dim)?; // (B,T,key_dim)
+        let k = qkv.narrow(2, self.key_dim,            self.key_dim)?;
+        let v = qkv.narrow(2, self.key_dim * 2,        self.value_dim)?;
+
+        let q = q.reshape((b, t, self.num_heads, self.head_k_dim))?;
+        let k = k.reshape((b, t, self.num_heads, self.head_k_dim))?;
+        let v = v.reshape((b, t, self.num_heads, self.head_v_dim))?;
+
+        // ── 4. L2-normalise Q, K; scale Q ────────────────────────────
+        let q = l2_normalize(&q)?;
+        let k = l2_normalize(&k)?;
+        let scale = 1.0 / (self.head_k_dim as f64).sqrt();
+        let q = (q * scale)?;
+
+        // ── 5. Decay & beta ───────────────────────────────────────────
+        // beta = sigmoid(b_proj)  (B, T, H)
+        let beta = candle_nn::ops::sigmoid(&b_proj)?;
+        // g = -A_log.exp() * softplus(a_proj + dt_bias)
+        let a_log_f = self.a_log.to_dtype(DType::F32)?;
+        let dt_f    = self.dt_bias.to_dtype(DType::F32)?;
+        let a_proj_f = a_proj.to_dtype(DType::F32)?;
+        let g = {
+            let sp = softplus(&a_proj_f.broadcast_add(&dt_f)?)?; // (B,T,H)
+            let decay = a_log_f.exp()?;                           // (H,)
+            sp.broadcast_mul(&decay)?.neg()?                      // g in (-inf, 0]
+        };
+        // exp(g) = actual decay factor in [0, 1]
+        let g_exp = g.exp()?.to_dtype(xs.dtype())?;
+        let beta  = beta.to_dtype(xs.dtype())?;
+
+        // Transpose heads: (B, T, H, dim) → per-step we'll slice T
+        let q = q.transpose(1, 2)?; // (B, H, T, Hk)
+        let k = k.transpose(1, 2)?;
+        let v = v.transpose(1, 2)?;
+        let g_exp = g_exp.transpose(1, 2)?;   // (B, H, T)
+        let beta  = beta.transpose(1, 2)?;
+
+        // ── 6. Recurrent computation ──────────────────────────────────
+        let mut state = match &self.recurrent_state {
+            Some(s) => s.clone(),
+            None => Tensor::zeros(
+                (b, self.num_heads, self.head_k_dim, self.head_v_dim),
+                xs.dtype(), xs.device(),
+            )?,
+        };
+
+        let mut step_outputs = Vec::with_capacity(t);
+        for pos in 0..t {
+            let q_t    = q.narrow(2, pos, 1)?.squeeze(2)?;      // (B, H, Hk)
+            let k_t    = k.narrow(2, pos, 1)?.squeeze(2)?;
+            let v_t    = v.narrow(2, pos, 1)?.squeeze(2)?;
+            let g_t    = g_exp.narrow(2, pos, 1)?.squeeze(2)?;  // (B, H)
+            let beta_t = beta.narrow(2, pos, 1)?.squeeze(2)?;
+
+            let (out_t, new_state) = self.recurrent_step(&state, &q_t, &k_t, &v_t, &g_t, &beta_t)?;
+            state = new_state;
+            step_outputs.push(out_t.unsqueeze(1)?); // (B, 1, H, Hv)
+        }
+        self.recurrent_state = Some(state);
+
+        // Concat → (B, T, H, Hv) → (B, T, value_dim)
+        let core_out = Tensor::cat(&step_outputs, 1)?;          // (B, T, H, Hv)
+        let core_out = core_out.reshape((b, t, self.value_dim))?;
+
+        // ── 7. Gated RMSNorm ─────────────────────────────────────────
+        // Reshape to (B*T*H, Hv) for per-head norm, z to same
+        let bth = b * t * self.num_heads;
+        let co_flat = core_out.reshape((bth, self.head_v_dim))?;
+        let z_flat  = z.reshape((b * t, self.num_heads, self.head_v_dim))?
+                       .reshape((bth, self.head_v_dim))?;
+
+        let normed = self.norm.forward(&co_flat, &z_flat)?; // (B*T*H, Hv)
+
+        let normed = normed.reshape((b, t, self.value_dim))?;
+
+        // ── 8. Output projection ──────────────────────────────────────
+        self.out_proj.forward(&normed)
+    }
+
+    fn clear_state(&mut self) {
+        self.conv_state = None;
+        self.recurrent_state = None;
     }
 }
 
@@ -628,25 +1067,38 @@ struct TextAttention {
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
+    /// Number of head dimensions that receive RoPE (partial_rotary_factor * head_dim).
+    /// For Qwen3.5 this is 64 (25% of 256); for Qwen3-VL it equals head_dim.
+    rope_dim: usize,
+    /// When true, q_proj output is doubled: first half = query, second half = gate.
+    /// After attention: attn_out = attn_out * sigmoid(gate) before o_proj.
+    attn_output_gate: bool,
     kv_cache: Option<(Tensor, Tensor)>,
     cache_seq_len: usize,
 }
 
 impl TextAttention {
     fn new(cfg: &TextConfig, vb: VarBuilder) -> candle_core::Result<Self> {
-        let h = cfg.hidden_size;
-        let nh = cfg.num_attention_heads;
+        let h   = cfg.hidden_size;
+        let nh  = cfg.num_attention_heads;
         let nkv = cfg.num_key_value_heads;
-        let hd = cfg.head_dim;
-        let q_dim = nh * hd;
+        let hd  = cfg.head_dim;
+        let q_dim  = nh * hd;
         let kv_dim = nkv * hd;
+        let gate   = cfg.attn_output_gate;
 
-        let q_proj = linear_no_bias(h, q_dim, vb.pp("q_proj"))?;
+        // q_proj output: doubled when using gated output (query + gate both nh*hd)
+        let q_proj_out = if gate { q_dim * 2 } else { q_dim };
+        let q_proj = linear_no_bias(h, q_proj_out, vb.pp("q_proj"))?;
         let k_proj = linear_no_bias(h, kv_dim, vb.pp("k_proj"))?;
         let v_proj = linear_no_bias(h, kv_dim, vb.pp("v_proj"))?;
 
-        // Fused QKV: merge weights into single matmul
-        let qkv_proj = {
+        // Fused QKV: merge weights into single matmul.
+        // For gated mode, only fuse the query-half of q_proj (first q_dim rows) with k, v.
+        let qkv_proj = if gate {
+            // Can't fuse when q has extra gate rows — skip fusion
+            None
+        } else {
             let qkv_w = Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?;
             Some(Linear::new(qkv_w, None))
         };
@@ -657,14 +1109,16 @@ impl TextAttention {
             k_proj,
             v_proj,
             o_proj: linear_no_bias(q_dim, h, vb.pp("o_proj"))?,
-            q_norm: rms_norm(hd, cfg.rms_norm_eps, vb.pp("q_norm"))?,
-            k_norm: rms_norm(hd, cfg.rms_norm_eps, vb.pp("k_norm"))?,
+            q_norm: if cfg.is_hybrid() { rms_norm_qwen35(hd, cfg.rms_norm_eps, vb.pp("q_norm"))? } else { rms_norm(hd, cfg.rms_norm_eps, vb.pp("q_norm"))? },
+            k_norm: if cfg.is_hybrid() { rms_norm_qwen35(hd, cfg.rms_norm_eps, vb.pp("k_norm"))? } else { rms_norm(hd, cfg.rms_norm_eps, vb.pp("k_norm"))? },
             q_dim,
             kv_dim,
             num_heads: nh,
             num_kv_heads: nkv,
             num_kv_groups: nh / nkv,
             head_dim: hd,
+            rope_dim: cfg.rope_dim(),
+            attn_output_gate: gate,
             kv_cache: None,
             cache_seq_len: 0,
         })
@@ -682,14 +1136,25 @@ impl TextAttention {
     ) -> candle_core::Result<Tensor> {
         let (b, seq_len, _) = xs.dims3()?;
 
-        let (q, k, v) = if let Some(ref qkv) = self.qkv_proj {
+        // When attn_output_gate: q_proj outputs num_heads * head_dim * 2.
+        // HF interleaved layout: each head h has [q_h(head_dim), gate_h(head_dim)].
+        // Must reshape to (B, T, num_heads, head_dim*2) then split on the last dim.
+        let (q, gate_signal, k, v) = if self.attn_output_gate {
+            let q_full = self.q_proj.forward(xs)?;  // (B, T, num_heads * head_dim * 2)
+            let q_full_r = q_full.reshape((b, seq_len, self.num_heads, self.head_dim * 2))?;
+            let q_half = q_full_r.narrow(D::Minus1, 0, self.head_dim)?
+                .contiguous()?.reshape((b, seq_len, self.q_dim))?;
+            let gate = q_full_r.narrow(D::Minus1, self.head_dim, self.head_dim)?
+                .contiguous()?.reshape((b, seq_len, self.q_dim))?;
+            (q_half, Some(gate), self.k_proj.forward(xs)?, self.v_proj.forward(xs)?)
+        } else if let Some(ref qkv) = self.qkv_proj {
             let qkv_out = qkv.forward(xs)?;
             let q = qkv_out.narrow(D::Minus1, 0, self.q_dim)?;
             let k = qkv_out.narrow(D::Minus1, self.q_dim, self.kv_dim)?;
             let v = qkv_out.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
-            (q, k, v)
+            (q, None, k, v)
         } else {
-            (self.q_proj.forward(xs)?, self.k_proj.forward(xs)?, self.v_proj.forward(xs)?)
+            (self.q_proj.forward(xs)?, None, self.k_proj.forward(xs)?, self.v_proj.forward(xs)?)
         };
 
         let q = q.reshape((b, seq_len, self.num_heads, self.head_dim))?;
@@ -705,9 +1170,21 @@ impl TextAttention {
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
 
-        // Apply M-RoPE
-        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, cos, sin)?;
-        let k = candle_nn::rotary_emb::rope(&k.contiguous()?, cos, sin)?;
+        // Apply M-RoPE (partial if rope_dim < head_dim)
+        let (q, k) = if self.rope_dim < self.head_dim {
+            // Qwen3.5: only rotate first rope_dim dimensions; leave the rest unchanged
+            let rd = self.rope_dim;
+            let pass = self.head_dim - rd;
+            let q_r  = candle_nn::rotary_emb::rope(&q.narrow(D::Minus1, 0, rd)?.contiguous()?, cos, sin)?;
+            let q_p  = q.narrow(D::Minus1, rd, pass)?.contiguous()?;
+            let k_r  = candle_nn::rotary_emb::rope(&k.narrow(D::Minus1, 0, rd)?.contiguous()?, cos, sin)?;
+            let k_p  = k.narrow(D::Minus1, rd, pass)?.contiguous()?;
+            (Tensor::cat(&[&q_r, &q_p], D::Minus1)?,
+             Tensor::cat(&[&k_r, &k_p], D::Minus1)?)
+        } else {
+            (candle_nn::rotary_emb::rope(&q.contiguous()?, cos, sin)?,
+             candle_nn::rotary_emb::rope(&k.contiguous()?, cos, sin)?)
+        };
         let v = v.contiguous()?;
 
         // Pre-allocated KV cache with slice_set: O(1) per decode step
@@ -777,7 +1254,7 @@ impl TextAttention {
                     let out = out
                         .reshape((b, self.num_heads, self.head_dim))?
                         .reshape((b, 1, self.num_heads * self.head_dim))?;
-                    return self.o_proj.forward(&out);
+                    return self.proj_with_gate(out, gate_signal.as_ref());
                 }
             }
 
@@ -794,7 +1271,7 @@ impl TextAttention {
             let out = out
                 .reshape((b, self.num_heads, self.head_dim))?
                 .reshape((b, 1, self.num_heads * self.head_dim))?;
-            return self.o_proj.forward(&out);
+            return self.proj_with_gate(out, gate_signal.as_ref());
         }
 
         // Standard path (prefill or num_kv_groups==1)
@@ -807,6 +1284,17 @@ impl TextAttention {
             seq_len > 1, // causal for prefill
         )?;
         let out = attn_output.transpose(1, 2)?.contiguous()?.reshape((b, seq_len, self.num_heads * self.head_dim))?;
+        self.proj_with_gate(out, gate_signal.as_ref())
+    }
+
+    /// Apply optional sigmoid gate then o_proj.
+    /// `gate`: flat `(B, T, q_dim)` from the doubled q_proj (qwen3.5 gated attention).
+    fn proj_with_gate(&self, out: Tensor, gate: Option<&Tensor>) -> candle_core::Result<Tensor> {
+        let out = if let Some(g) = gate {
+            out.mul(&candle_nn::ops::sigmoid(g)?)?
+        } else {
+            out
+        };
         self.o_proj.forward(&out)
     }
 
@@ -886,13 +1374,17 @@ struct TextDecoderLayer {
 
 impl TextDecoderLayer {
     fn new(cfg: &TextConfig, vb: VarBuilder) -> candle_core::Result<Self> {
-        let post_attn_ln_weight = vb
-            .pp("post_attention_layernorm")
-            .get_with_hints(cfg.hidden_size, "weight", candle_nn::Init::Const(1.))?;
+        let post_attn_ln_weight = ln_weight_for_cfg(
+            cfg.hidden_size, cfg, vb.pp("post_attention_layernorm"),
+        )?;
         Ok(Self {
             self_attn: TextAttention::new(cfg, vb.pp("self_attn"))?,
             mlp: TextMLP::new(cfg, vb.pp("mlp"))?,
-            input_ln: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
+            input_ln: if cfg.is_hybrid() {
+                rms_norm_qwen35(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?
+            } else {
+                rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?
+            },
             post_attn_ln_weight,
             rms_norm_eps: cfg.rms_norm_eps,
         })
@@ -924,6 +1416,194 @@ impl TextDecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
+    }
+}
+
+// ── Text: Linear (GDN) Decoder Layer ─────────────────────────────────
+
+struct LinearDecoderLayer {
+    linear_attn: GatedDeltaNet,
+    mlp:         TextMLP,
+    input_ln:    RmsNorm,
+    post_attn_ln_weight: Tensor,
+    rms_norm_eps: f64,
+}
+
+impl LinearDecoderLayer {
+    fn new(cfg: &TextConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        let post_attn_ln_weight = ln_weight_for_cfg(
+            cfg.hidden_size, cfg, vb.pp("post_attention_layernorm"),
+        )?;
+        Ok(Self {
+            linear_attn: GatedDeltaNet::new(cfg, vb.pp("linear_attn"))?,
+            mlp:         TextMLP::new(cfg, vb.pp("mlp"))?,
+            input_ln:    rms_norm_qwen35(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
+            post_attn_ln_weight,
+            rms_norm_eps: cfg.rms_norm_eps,
+        })
+    }
+
+    fn forward(&mut self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_ln.forward(xs)?;
+        let xs = self.linear_attn.forward(&xs)?;
+
+        let (new_residual, h) = crate::fused_ops::fused_add_rmsnorm(
+            residual,
+            &xs,
+            &self.post_attn_ln_weight,
+            self.rms_norm_eps,
+        )?;
+        let h = self.mlp.forward(&h)?;
+        &new_residual + h
+    }
+
+    fn clear_state(&mut self) {
+        self.linear_attn.clear_state();
+    }
+}
+
+// ── Text: Hybrid Decoder Layer ────────────────────────────────────────
+
+enum HybridDecoderLayer {
+    Full(TextDecoderLayer),
+    Linear(LinearDecoderLayer),
+}
+
+impl HybridDecoderLayer {
+    fn new(cfg: &TextConfig, layer_idx: usize, vb: VarBuilder) -> candle_core::Result<Self> {
+        match cfg.layer_type(layer_idx) {
+            "linear_attention" => Ok(Self::Linear(LinearDecoderLayer::new(cfg, vb)?)),
+            _                  => Ok(Self::Full(TextDecoderLayer::new(cfg, vb)?)),
+        }
+    }
+
+    fn forward(
+        &mut self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Full(l)   => l.forward(xs, cos, sin, mask, batch_kv_info),
+            Self::Linear(l) => l.forward(xs),
+        }
+    }
+
+    fn clear_cache(&mut self) {
+        match self {
+            Self::Full(l)   => l.clear_kv_cache(),
+            Self::Linear(l) => l.clear_state(),
+        }
+    }
+
+    fn kv_cache_bytes(&self) -> u64 {
+        match self {
+            Self::Full(l) => l.self_attn.kv_cache.as_ref().map(|(k, v)| {
+                (k.elem_count() + v.elem_count()) as u64 * k.dtype().size_in_bytes() as u64
+            }).unwrap_or(0),
+            Self::Linear(_) => 0,
+        }
+    }
+
+    fn get_kv_cache(&self) -> Option<(Tensor, Tensor)> {
+        match self {
+            Self::Full(l) => l.self_attn.kv_cache.as_ref().map(|(k, v)| {
+                let len = l.self_attn.cache_seq_len;
+                if len > 0 && len < k.dim(2).unwrap_or(0) {
+                    (
+                        k.narrow(2, 0, len).and_then(|t| t.contiguous()).unwrap_or_else(|_| k.clone()),
+                        v.narrow(2, 0, len).and_then(|t| t.contiguous()).unwrap_or_else(|_| v.clone()),
+                    )
+                } else {
+                    (k.clone(), v.clone())
+                }
+            }),
+            Self::Linear(_) => None,
+        }
+    }
+
+    fn set_kv_cache(&mut self, cache: Option<(Tensor, Tensor)>) {
+        if let Self::Full(l) = self {
+            match cache {
+                Some((k, v)) => {
+                    let seq_len = k.dim(2).unwrap_or(0);
+                    let room = 256;
+                    let (b, h, _s, d) = k.dims4().unwrap();
+                    let buf_k = Tensor::zeros((b, h, seq_len + room, d), k.dtype(), k.device()).unwrap();
+                    let buf_v = Tensor::zeros((b, h, seq_len + room, d), v.dtype(), v.device()).unwrap();
+                    buf_k.slice_set(&k, 2, 0).unwrap();
+                    buf_v.slice_set(&v, 2, 0).unwrap();
+                    l.self_attn.kv_cache = Some((buf_k, buf_v));
+                    l.self_attn.cache_seq_len = seq_len;
+                }
+                None => { l.self_attn.kv_cache = None; l.self_attn.cache_seq_len = 0; }
+            }
+        }
+    }
+
+    fn set_batched_kv(
+        &mut self,
+        kv: Option<(Tensor, Tensor)>,
+        seq_len: usize,
+        extra_room: usize,
+    ) -> candle_core::Result<()> {
+        if let Self::Full(l) = self {
+            match kv {
+                Some((k, v)) => {
+                    if extra_room > 0 {
+                        let (b, h, s, d) = k.dims4()?;
+                        let buf_k = Tensor::zeros((b, h, s + extra_room, d), k.dtype(), k.device())?;
+                        let buf_v = Tensor::zeros((b, h, s + extra_room, d), v.dtype(), v.device())?;
+                        buf_k.slice_set(&k, 2, 0)?;
+                        buf_v.slice_set(&v, 2, 0)?;
+                        l.self_attn.kv_cache = Some((buf_k, buf_v));
+                    } else {
+                        l.self_attn.kv_cache = Some((k, v));
+                    }
+                    l.self_attn.cache_seq_len = seq_len;
+                }
+                None => { l.self_attn.kv_cache = None; l.self_attn.cache_seq_len = 0; }
+            }
+        }
+        Ok(())
+    }
+
+    fn extract_batch_kv_for_seqs(
+        &mut self,
+        n_seqs: usize,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) -> candle_core::Result<Vec<Option<(Tensor, Tensor)>>> {
+        match self {
+            Self::Full(l) => {
+                let mut results = Vec::with_capacity(n_seqs);
+                if let Some((ref full_k, ref full_v)) = l.self_attn.kv_cache {
+                    for i in 0..n_seqs {
+                        let row_k = full_k.narrow(0, i, 1)?;
+                        let row_v = full_v.narrow(0, i, 1)?;
+                        let total = kv_lens[i] + rounds_done;
+                        let offset = original_max_kv - kv_lens[i];
+                        results.push(Some((
+                            row_k.narrow(2, offset, total)?.contiguous()?,
+                            row_v.narrow(2, offset, total)?.contiguous()?,
+                        )));
+                    }
+                } else {
+                    for _ in 0..n_seqs { results.push(None); }
+                }
+                l.self_attn.kv_cache = None;
+                l.self_attn.cache_seq_len = 0;
+                Ok(results)
+            }
+            Self::Linear(l) => {
+                l.clear_state();
+                Ok((0..n_seqs).map(|_| None).collect())
+            }
+        }
     }
 }
 
@@ -985,7 +1665,7 @@ fn scatter_vision_features(
 
 pub struct TextDecoder {
     embed_tokens: Embedding,
-    layers: Vec<TextDecoderLayer>,
+    layers: Vec<HybridDecoderLayer>,
     norm: RmsNorm,
     lm_head: Option<Linear>,
     device: Device,
@@ -1001,9 +1681,13 @@ impl TextDecoder {
         let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            layers.push(TextDecoderLayer::new(cfg, vb.pp(&format!("layers.{}", i)))?);
+            layers.push(HybridDecoderLayer::new(cfg, i, vb.pp(&format!("layers.{}", i)))?);
         }
-        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
+        let norm = if cfg.is_hybrid() {
+            rms_norm_qwen35(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?
+        } else {
+            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?
+        };
 
         // Keep lm_head in F32 for BF16 models: cuBLAS computes BF16 matmul with F32
         // accumulation but casts output back to BF16, which can flip argmax at the EOS
@@ -1087,6 +1771,7 @@ impl TextDecoder {
         };
 
         let mut h = xs;
+
         for (i, layer) in self.layers.iter_mut().enumerate() {
             h = layer.forward(&h, cos, sin, mask.as_ref(), None)?;
 
@@ -1096,6 +1781,7 @@ impl TextDecoder {
                     h = (h + &scattered[i])?;
                 }
             }
+
         }
 
         let h = self.norm.forward(&h)?;
@@ -1103,7 +1789,9 @@ impl TextDecoder {
         // Cast to F32 for lm_head when BF16 (lm_head weights stored in F32 for precision)
         let lm_head = self.lm_head.as_ref().expect("lm_head required for generation");
         let h = if self.dtype == DType::BF16 { h.to_dtype(DType::F32)? } else { h };
-        h.apply(lm_head)
+        let logits = h.apply(lm_head)?;
+
+        Ok(logits)
     }
 
     /// Forward pass that returns ALL hidden states after norm (no lm_head, no token narrowing).
@@ -1163,7 +1851,7 @@ impl TextDecoder {
 
     pub fn clear_kv_cache(&mut self) {
         for layer in &mut self.layers {
-            layer.clear_kv_cache();
+            layer.clear_cache();
         }
     }
 
@@ -1174,68 +1862,18 @@ impl TextDecoder {
 
     /// Total bytes held by the model's KV caches (no GPU copies).
     pub fn active_kv_cache_bytes(&self) -> u64 {
-        self.layers
-            .iter()
-            .map(|l| {
-                l.self_attn
-                    .kv_cache
-                    .as_ref()
-                    .map(|(k, v)| {
-                        let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                        let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
-                        k_bytes + v_bytes
-                    })
-                    .unwrap_or(0)
-            })
-            .sum()
+        self.layers.iter().map(|l| l.kv_cache_bytes()).sum()
     }
 
     /// Extract per-layer KV caches, narrowed to the valid `cache_seq_len`.
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
-        self.layers
-            .iter()
-            .map(|l| {
-                l.self_attn.kv_cache.as_ref().map(|(k, v)| {
-                    let len = l.self_attn.cache_seq_len;
-                    if len > 0 && len < k.dim(2).unwrap_or(0) {
-                        (
-                            k.narrow(2, 0, len)
-                                .and_then(|t| t.contiguous())
-                                .unwrap_or_else(|_| k.clone()),
-                            v.narrow(2, 0, len)
-                                .and_then(|t| t.contiguous())
-                                .unwrap_or_else(|_| v.clone()),
-                        )
-                    } else {
-                        (k.clone(), v.clone())
-                    }
-                })
-            })
-            .collect()
+        self.layers.iter().map(|l| l.get_kv_cache()).collect()
     }
 
     /// Restore per-layer KV caches into the model.
     pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
-        for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
-            match cache {
-                Some((k, v)) => {
-                    let seq_len = k.dim(2).unwrap_or(0);
-                    // Pre-allocate room so the first decode step after swap-in
-                    // can do in-place slice_set instead of reallocating.
-                    let room = 256;
-                    let (b, h, _s, d) = k.dims4().unwrap();
-                    let buf_k = Tensor::zeros((b, h, seq_len + room, d), k.dtype(), k.device()).unwrap();
-                    let buf_v = Tensor::zeros((b, h, seq_len + room, d), v.dtype(), v.device()).unwrap();
-                    buf_k.slice_set(&k, 2, 0).unwrap();
-                    buf_v.slice_set(&v, 2, 0).unwrap();
-                    layer.self_attn.kv_cache = Some((buf_k, buf_v));
-                    layer.self_attn.cache_seq_len = seq_len;
-                }
-                None => {
-                    layer.self_attn.kv_cache = None;
-                    layer.self_attn.cache_seq_len = 0;
-                }
-            }
+        for (layer, cache) in self.layers.iter_mut().zip(caches) {
+            layer.set_kv_cache(cache);
         }
     }
 
@@ -1255,10 +1893,12 @@ impl TextDecoder {
         let kv_lens: Vec<usize> = seq_kv_caches
             .iter()
             .map(|caches| {
+                // Use the first non-None cache to determine KV length.
+                // Hybrid models (e.g. Qwen3.5) have GDN layers (no KV cache) before
+                // full-attention layers, so caches[0] is None — must skip those.
                 caches
-                    .first()
-                    .and_then(|c| c.as_ref())
-                    .map(|(k, _)| k.dim(2).unwrap_or(0))
+                    .iter()
+                    .find_map(|c| c.as_ref().map(|(k, _)| k.dim(2).unwrap_or(0)))
                     .unwrap_or(0)
             })
             .collect();
@@ -1277,25 +1917,7 @@ impl TextDecoder {
                 self.dtype,
             )?;
 
-            if let Some((k, v)) = batched_kv {
-                // k, v already contiguous from pad_and_stack_kv_caches.
-                if extra_room > 0 {
-                    let (b, h, s, d) = k.dims4()?;
-                    let buf_k =
-                        Tensor::zeros((b, h, s + extra_room, d), k.dtype(), k.device())?;
-                    let buf_v =
-                        Tensor::zeros((b, h, s + extra_room, d), v.dtype(), v.device())?;
-                    buf_k.slice_set(&k, 2, 0)?;
-                    buf_v.slice_set(&v, 2, 0)?;
-                    layer.self_attn.kv_cache = Some((buf_k, buf_v));
-                } else {
-                    layer.self_attn.kv_cache = Some((k, v));
-                }
-                layer.self_attn.cache_seq_len = max_kv_len;
-            } else {
-                layer.self_attn.kv_cache = None;
-                layer.self_attn.cache_seq_len = 0;
-            }
+            layer.set_batched_kv(batched_kv, max_kv_len, extra_room)?;
         }
 
         Ok((kv_lens, max_kv_len))
@@ -1337,28 +1959,112 @@ impl TextDecoder {
             .collect();
 
         for layer in self.layers.iter_mut() {
-            if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
-                for i in 0..n_seqs {
-                    let row_k = full_k.narrow(0, i, 1)?;
-                    let row_v = full_v.narrow(0, i, 1)?;
-                    let total = kv_lens[i] + rounds_done;
-                    let offset = original_max_kv - kv_lens[i];
-                    let clean = Some((
-                        row_k.narrow(2, offset, total)?.contiguous()?,
-                        row_v.narrow(2, offset, total)?.contiguous()?,
-                    ));
-                    result[i].push(clean);
-                }
-            } else {
-                for i in 0..n_seqs {
-                    result[i].push(None);
-                }
+            let per_seq = layer.extract_batch_kv_for_seqs(
+                n_seqs, kv_lens, original_max_kv, rounds_done,
+            )?;
+            for (i, kv) in per_seq.into_iter().enumerate() {
+                result[i].push(kv);
             }
-            layer.self_attn.kv_cache = None;
-            layer.self_attn.cache_seq_len = 0;
         }
 
         Ok(result)
+    }
+
+    // ── GDN (linear attention) state management ──────────────────────
+
+    /// Extract per-sequence GDN recurrent+conv states from the batched model.
+    /// Returns `[n_seqs][n_layers]` where linear layers have `Some((recurrent, conv))`.
+    /// Clears the GDN state from all linear layers after extraction.
+    pub fn extract_batch_gdn_states(
+        &mut self,
+        n_seqs: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        let n_layers = self.layers.len();
+        let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> =
+            (0..n_seqs).map(|_| vec![None; n_layers]).collect();
+
+        for (li, layer) in self.layers.iter_mut().enumerate() {
+            if let HybridDecoderLayer::Linear(l) = layer {
+                let r = l.linear_attn.recurrent_state.take();
+                let c = l.linear_attn.conv_state.take();
+                if let (Some(r), Some(c)) = (r, c) {
+                    for i in 0..n_seqs {
+                        let r_i = r.narrow(0, i, 1)?.contiguous()?;
+                        let c_i = c.narrow(0, i, 1)?.contiguous()?;
+                        result[i][li] = Some((r_i, c_i));
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Extract single-sequence (B=1) GDN states from the model.
+    /// Used after prefill to save states before the model is cleared.
+    pub fn extract_single_gdn_states(&mut self) -> Vec<Option<(Tensor, Tensor)>> {
+        let n_layers = self.layers.len();
+        let mut result: Vec<Option<(Tensor, Tensor)>> = vec![None; n_layers];
+        for (li, layer) in self.layers.iter().enumerate() {
+            if let HybridDecoderLayer::Linear(l) = layer {
+                let r = l.linear_attn.recurrent_state.as_ref();
+                let c = l.linear_attn.conv_state.as_ref();
+                if let (Some(r), Some(c)) = (r, c) {
+                    result[li] = Some((r.clone(), c.clone()));
+                }
+            }
+        }
+        result
+    }
+
+    /// Restore per-sequence GDN states into the model as a batch tensor.
+    /// `states[i][li]` = Some((recurrent_i, conv_i)) for sequence i, linear layer li.
+    /// None entries are filled with zeros.
+    pub fn restore_batch_gdn_states(
+        &mut self,
+        states: &[Vec<Option<(Tensor, Tensor)>>],
+    ) -> candle_core::Result<()> {
+        if states.is_empty() {
+            return Ok(());
+        }
+        let n_seqs = states.len();
+        let device = self.embed_tokens.embeddings().device().clone();
+
+        for (li, layer) in self.layers.iter_mut().enumerate() {
+            if let HybridDecoderLayer::Linear(l) = layer {
+                let gdn = &l.linear_attn;
+                let h = gdn.num_heads;
+                let hk = gdn.head_k_dim;
+                let hv = gdn.head_v_dim;
+                let c_dim = gdn.conv_dim;
+                let ks = gdn.conv_ks;
+
+                // Collect per-sequence recurrent and conv states
+                let mut recurrent_rows = Vec::with_capacity(n_seqs);
+                let mut conv_rows = Vec::with_capacity(n_seqs);
+
+                for i in 0..n_seqs {
+                    let entry = if li < states[i].len() { states[i][li].as_ref() } else { None };
+                    match entry {
+                        Some((r, c)) => {
+                            recurrent_rows.push(r.clone());
+                            conv_rows.push(c.clone());
+                        }
+                        None => {
+                            recurrent_rows.push(
+                                Tensor::zeros((1, h, hk, hv), self.dtype, &device)?
+                            );
+                            conv_rows.push(
+                                Tensor::zeros((1, c_dim, ks - 1), self.dtype, &device)?
+                            );
+                        }
+                    }
+                }
+
+                l.linear_attn.recurrent_state = Some(Tensor::cat(&recurrent_rows, 0)?);
+                l.linear_attn.conv_state = Some(Tensor::cat(&conv_rows, 0)?);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1517,9 +2223,17 @@ impl Qwen3VL {
             image_blocks.push_str("<|vision_end|>");
         }
 
+        // Qwen3.5 is a thinking model: the chat template appends
+        // "<think>\n\n</think>\n\n" after the assistant prefix to suppress
+        // the chain-of-thought and jump straight to the answer.
+        let think_prefix = if self.config.text_config.is_hybrid() {
+            "<think>\n\n</think>\n\n"
+        } else {
+            ""
+        };
         Ok(format!(
-            "<|im_start|>user\n{}{}<|im_end|>\n<|im_start|>assistant\n",
-            image_blocks, user_text
+            "<|im_start|>user\n{}{}<|im_end|>\n<|im_start|>assistant\n{}",
+            image_blocks, user_text, think_prefix
         ))
     }
 
