@@ -4,67 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-crane = { path = "../crane" }
 crane-core = { path = "../crane-core" }
 anyhow = "1.0.100"
 image = "0.25.9"
-serde_json = "1"
-
-[[bin]]
-name = "chat_simple"
-path = "src/chat_simple.rs"
-
-[[bin]]
-name = "chat_streaming"
-path = "src/chat_streaming.rs"
-
-[[bin]]
-name = "asr_simple"
-path = "src/asr_simple.rs"
-
-[[bin]]
-name = "vision_simple"
-path = "src/vision_simple.rs"
-
-[[bin]]
-name = "bm_resize"
-path = "src/bm_resize.rs"
-
-[[bin]]
-name = "ocr_simple"
-path = "src/ocr_simple.rs"
-
-[[bin]]
-name = "tts_simple"
-path = "src/tts_simple.rs"
-
-[[bin]]
-name = "tts_custom_voice"
-path = "src/tts_custom_voice.rs"
-
-[[bin]]
-name = "tts_voice_clone"
-path = "src/tts_voice_clone.rs"
-
-[[bin]]
-name = "hunyuan_simple"
-path = "src/hunyuan_simple.rs"
-
-[[bin]]
-name = "llava_simple"
-path = "src/llava_simple.rs"
-
-[[bin]]
-name = "qwen3_vl_simple"
-path = "src/qwen3_vl_simple.rs"
 
 [[bin]]
 name = "embedding_simple"
 path = "src/embedding_simple.rs"
 
+[[bin]]
+name = "embedding_oracle_test"
+path = "src/embedding_oracle_test.rs"
+
 [features]
 default = []
-onnx = ["crane/onnx"]
 cuda = ["crane-core/cuda"]
 flash-attn = ["cuda", "crane-core/flash-attn"]
-

@@ -6,7 +6,7 @@
 //! Reference: OpenSearch-AI/Ops-Colqwen3-4B
 
 use anyhow::{Error as E, Result};
-use candle_core::{DType, Device, IndexOp, Module, Shape, Tensor, D};
+use candle_core::{DType, Device, Module, Shape, Tensor, D};
 use candle_nn::{linear, Linear, VarBuilder};
 use serde::Deserialize;
 use std::path::Path;
@@ -99,7 +99,7 @@ impl ColQwen3Emb {
         let vision = VisionModel::new(vb.pp("visual"), &config.vision_config)?;
 
         println!("Loading text decoder (embedding mode, no lm_head)...");
-        let decoder = TextDecoder::new(&config.text_config, vb.pp("language_model"), false)?;
+        let decoder = TextDecoder::new(&config.text_config, vb.pp("language_model"))?;
 
         println!("Loading projection layer...");
         let custom_text_proj = linear(
@@ -173,7 +173,6 @@ impl ColQwen3Emb {
             let (cos, sin) = self.mrope.forward(&position_ids)?;
 
             // Forward through decoder (returns all hidden states)
-            self.decoder.clear_kv_cache();
             let hidden = self.decoder.forward_hidden(
                 input_embeds, &cos, &sin,
                 Some(&deepstack_features), Some(&vision_mask),
@@ -221,7 +220,6 @@ impl ColQwen3Emb {
             let (position_ids, _) = self.compute_mrope_positions(&input_ids, &single_grid)?;
             let (cos, sin) = self.mrope.forward(&position_ids)?;
 
-            self.decoder.clear_kv_cache();
             let hidden = self.decoder.forward_hidden(
                 input_embeds, &cos, &sin,
                 Some(&deepstack_features), Some(&vision_mask),
@@ -266,7 +264,6 @@ impl ColQwen3Emb {
             let (cos, sin) = self.mrope.forward(&position_ids)?;
 
             // Forward (no vision features)
-            self.decoder.clear_kv_cache();
             let hidden = self.decoder.forward_hidden(
                 input_embeds, &cos, &sin, None, None,
             )?;
@@ -296,22 +293,20 @@ impl ColQwen3Emb {
         }
 
         let device = qs[0].device();
+        let dtype = qs[0].dtype();
         let dims = qs[0].dim(D::Minus1)?;
 
-        // Pad all passages to max_seq_len and stack into (N, max_sp, dims)
+        // Pre-allocate (N_pages, max_sp, dims) zeros and slice_assign each passage.
+        // Avoids per-passage cat (which copies the full max_sp×dims block).
         let max_sp = ps.iter().map(|p| p.dim(0).unwrap_or(0)).max().unwrap_or(0);
-        let mut padded_ps = Vec::with_capacity(ps.len());
-        for p in ps {
+        let mut ps_stacked = Tensor::zeros((ps.len(), max_sp, dims), dtype, device)?;
+        for (i, p) in ps.iter().enumerate() {
             let sp = p.dim(0)?;
-            if sp < max_sp {
-                let pad = Tensor::zeros((max_sp - sp, dims), p.dtype(), device)?;
-                padded_ps.push(Tensor::cat(&[p, &pad], 0)?);
-            } else {
-                padded_ps.push(p.clone());
-            }
+            ps_stacked = ps_stacked.slice_assign(
+                &[i..i + 1, 0..sp, 0..dims],
+                &p.unsqueeze(0)?,
+            )?;
         }
-        // (N_pages, max_sp, dims)
-        let ps_stacked = Tensor::stack(&padded_ps, 0)?;
         // (N_pages, dims, max_sp) for matmul
         let ps_t = ps_stacked.transpose(1, 2)?.contiguous()?;
 
@@ -372,12 +367,13 @@ impl ColQwen3Emb {
     }
 
     fn build_visual_prompt(&self, n_vis_tokens: usize) -> String {
-        // Build the visual prompt template matching the Python processor
+        // Matches OpsColQwen3Processor.visual_prompt_prefix exactly — no `\n`
+        // between <|im_end|> and <|im_start|>.
         let mut prompt = String::from("<|im_start|>user\n<|vision_start|>");
         for _ in 0..n_vis_tokens {
             prompt.push_str("<|image_pad|>");
         }
-        prompt.push_str("<|vision_end|>Describe the image.<|im_end|>\n<|im_start|>assistant\n<|endoftext|>");
+        prompt.push_str("<|vision_end|>Describe the image.<|im_end|><|im_start|>assistant\n<|endoftext|>");
         prompt
     }
 
@@ -441,6 +437,10 @@ impl ColQwen3Emb {
         Ok((position_ids, text_pos))
     }
 
+    /// Build (input_embeds, vision_mask) by:
+    ///   1) ONE embed call over the whole id sequence (image_pad rows will be overwritten)
+    ///   2) slice_assign of vision embeddings over the image_pad positions.
+    /// Numerically equivalent to embedding text-runs and concatenating with vision blocks.
     fn merge_embeddings(
         &self,
         input_ids: &[u32],
@@ -448,51 +448,44 @@ impl ColQwen3Emb {
     ) -> candle_core::Result<(Tensor, Tensor)> {
         let image_token = self.config.image_token_id;
         let num_vis_tokens = image_embeds.dim(0)?;
-        let mut parts: Vec<Tensor> = Vec::new();
-        let mut mask_vals: Vec<f32> = Vec::new();
-        let mut vis_idx = 0;
-        let mut current_text: Vec<u32> = Vec::new();
-        let mut vis_run_start: Option<usize> = None;
-        let mut vis_run_len = 0usize;
+        let hidden_size = image_embeds.dim(1)?;
+        let n = input_ids.len();
 
-        for &id in input_ids {
-            if id == image_token && vis_idx < num_vis_tokens {
-                if !current_text.is_empty() {
-                    let ids = Tensor::new(current_text.as_slice(), &self.device)?;
-                    let emb = self.decoder.embed(&ids)?;
-                    mask_vals.extend(std::iter::repeat(0.0f32).take(current_text.len()));
-                    parts.push(emb);
-                    current_text.clear();
+        // Single embed pass — image_pad rows will be replaced below.
+        let ids_tensor = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?;
+        let mut combined = self.decoder.embed(&ids_tensor)?; // (1, N, H)
+
+        // Detect contiguous runs of image_pad and the per-position mask.
+        let mut mask_vals: Vec<f32> = Vec::with_capacity(n);
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new(); // (text_pos, vis_offset, len)
+        let mut vis_off = 0usize;
+        let mut run_start: Option<(usize, usize)> = None;
+
+        for (i, &id) in input_ids.iter().enumerate() {
+            if id == image_token && vis_off < num_vis_tokens {
+                mask_vals.push(1.0f32);
+                if run_start.is_none() {
+                    run_start = Some((i, vis_off));
                 }
-                if vis_run_start.is_none() {
-                    vis_run_start = Some(vis_idx);
-                    vis_run_len = 0;
+                vis_off += 1;
+                if i + 1 == n || input_ids[i + 1] != image_token || vis_off == num_vis_tokens {
+                    let (rs, vs) = run_start.take().unwrap();
+                    runs.push((rs, vs, i - rs + 1));
                 }
-                vis_run_len += 1;
-                vis_idx += 1;
             } else {
-                if let Some(start) = vis_run_start.take() {
-                    let block = image_embeds.narrow(0, start, vis_run_len)?;
-                    parts.push(block);
-                    mask_vals.extend(std::iter::repeat(1.0f32).take(vis_run_len));
-                    vis_run_len = 0;
-                }
-                current_text.push(id);
+                mask_vals.push(0.0f32);
             }
         }
-        if let Some(start) = vis_run_start.take() {
-            let block = image_embeds.narrow(0, start, vis_run_len)?;
-            parts.push(block);
-            mask_vals.extend(std::iter::repeat(1.0f32).take(vis_run_len));
-        }
-        if !current_text.is_empty() {
-            let ids = Tensor::new(current_text.as_slice(), &self.device)?;
-            let emb = self.decoder.embed(&ids)?;
-            mask_vals.extend(std::iter::repeat(0.0f32).take(current_text.len()));
-            parts.push(emb);
+
+        // Overwrite image_pad rows with vision embeddings.
+        for (text_pos, vis_offset, len) in runs {
+            let block = image_embeds.narrow(0, vis_offset, len)?.unsqueeze(0)?;
+            combined = combined.slice_assign(
+                &[0..1, text_pos..text_pos + len, 0..hidden_size],
+                &block,
+            )?;
         }
 
-        let combined = Tensor::cat(&parts, 0)?.unsqueeze(0)?;
         let mask = Tensor::new(mask_vals, &self.device)?;
         Ok((combined, mask))
     }
