@@ -1,3 +1,3 @@
 [workspace]
-members = ["crane-core", "crane", "crane-oai", "example"]
+members = ["crane-core", "example"]
 resolver = "2"

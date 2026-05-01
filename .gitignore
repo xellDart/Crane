@@ -12,3 +12,16 @@ outputs/
 # tests/
 .vscode/
 /vendor
+
+# Build outputs
+/release/
+
+# Local model checkpoint (8GB)
+/colqwen3-4b/
+
+# Test harness outputs (regenerable)
+/test_embeddings/*.npz
+/test_embeddings/*.log
+/test_embeddings/crane_*.bin
+/test_embeddings/crane_meta.txt
+/test_embeddings/python_oracle_meta.json
