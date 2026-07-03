@@ -549,8 +549,11 @@ impl VisionModel {
 // ── M-RoPE (Multimodal Rotary Position Embeddings) ───────────────────
 
 pub struct MRoPE {
-    inv_freq: Tensor,
+    /// Host copy: cos/sin tables are built on CPU, so keeping inv_freq on the
+    /// host avoids a device→host download on every forward.
+    inv_freq: Vec<f32>,
     mrope_section: Vec<usize>,
+    device: Device,
     dtype: DType,
 }
 
@@ -562,22 +565,24 @@ impl MRoPE {
         let inv_freq: Vec<f32> = (0..half_dim)
             .map(|i| 1.0 / theta.powf(2.0 * i as f64 / rope_dim as f64) as f32)
             .collect();
-        let inv_freq = Tensor::from_vec(inv_freq, half_dim, device)?;
         let mrope_section = cfg.rope_mrope_section();
-        Ok(Self { inv_freq, mrope_section, dtype })
+        Ok(Self { inv_freq, mrope_section, device: device.clone(), dtype })
     }
 
-    pub fn forward(&self, position_ids: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
-        // position_ids: (3, seq_len) — [temporal, height, width]
-        let device = self.inv_freq.device();
-        let half_dim = self.inv_freq.dims()[0];
-        let seq_len = position_ids.dim(1)?;
+    /// Positions come straight from the host (they are computed on CPU by the
+    /// callers anyway): no device round-trip. Only the final cos/sin tables
+    /// are uploaded. Bit-identical to the old Tensor-based path.
+    pub fn forward_positions(
+        &self,
+        t_pos: &[i64],
+        h_pos: &[i64],
+        w_pos: &[i64],
+    ) -> candle_core::Result<(Tensor, Tensor)> {
+        let device = &self.device;
+        let half_dim = self.inv_freq.len();
+        let seq_len = t_pos.len();
         let sections = &self.mrope_section;
-        let inv_freq_vec = self.inv_freq.to_vec1::<f32>()?;
-
-        let t_pos = position_ids.i(0)?.to_vec1::<i64>()?;
-        let h_pos = position_ids.i(1)?.to_vec1::<i64>()?;
-        let w_pos = position_ids.i(2)?.to_vec1::<i64>()?;
+        let inv_freq_vec = &self.inv_freq;
 
         let min_section = *sections.iter().min().unwrap();
 
