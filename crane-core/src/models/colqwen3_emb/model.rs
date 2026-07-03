@@ -168,9 +168,9 @@ impl ColQwen3Emb {
             let (input_embeds, vision_mask) = self.merge_embeddings(&input_ids, &img_embeds)?;
 
             // M-RoPE positions
-            let single_grid = grid_thw.narrow(0, grid_thw_vec.iter().position(|g| g == grid).unwrap_or(0), 1)?;
-            let (position_ids, _) = self.compute_mrope_positions(&input_ids, &single_grid)?;
-            let (cos, sin) = self.mrope.forward(&position_ids)?;
+            let (t_pos, h_pos, w_pos) =
+                self.compute_mrope_positions(&input_ids, std::slice::from_ref(grid));
+            let (cos, sin) = self.mrope.forward_positions(&t_pos, &h_pos, &w_pos)?;
 
             // Forward through decoder (returns all hidden states)
             let hidden = self.decoder.forward_hidden(
@@ -216,9 +216,9 @@ impl ColQwen3Emb {
 
             let (input_embeds, vision_mask) = self.merge_embeddings(&input_ids, &img_embeds)?;
 
-            let single_grid = grid_thw.narrow(0, grid_thw_vec.iter().position(|g| g == grid).unwrap_or(0), 1)?;
-            let (position_ids, _) = self.compute_mrope_positions(&input_ids, &single_grid)?;
-            let (cos, sin) = self.mrope.forward(&position_ids)?;
+            let (t_pos, h_pos, w_pos) =
+                self.compute_mrope_positions(&input_ids, std::slice::from_ref(grid));
+            let (cos, sin) = self.mrope.forward_positions(&t_pos, &h_pos, &w_pos)?;
 
             let hidden = self.decoder.forward_hidden(
                 input_embeds, &cos, &sin,
@@ -259,9 +259,7 @@ impl ColQwen3Emb {
 
             // M-RoPE: text-only → all 3 dims get same sequential positions
             let positions: Vec<i64> = (0..seq_len as i64).collect();
-            let pos_tensor = Tensor::new(positions.as_slice(), &self.device)?;
-            let position_ids = Tensor::stack(&[pos_tensor.clone(), pos_tensor.clone(), pos_tensor], 0)?;
-            let (cos, sin) = self.mrope.forward(&position_ids)?;
+            let (cos, sin) = self.mrope.forward_positions(&positions, &positions, &positions)?;
 
             // Forward (no vision features)
             let hidden = self.decoder.forward_hidden(
@@ -377,12 +375,13 @@ impl ColQwen3Emb {
         prompt
     }
 
+    /// Everything stays on the host (callers hand the positions straight to
+    /// MRoPE::forward_positions): no per-image grid download or position upload.
     fn compute_mrope_positions(
         &self,
         input_ids: &[u32],
-        grid_thw: &Tensor,
-    ) -> Result<(Tensor, i64)> {
-        let grid_thw_vec = grid_thw.to_vec2::<u32>()?;
+        grid_thw_vec: &[Vec<u32>],
+    ) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
         let merge = self.config.vision_config.spatial_merge_size as i64;
         let image_token = self.config.image_token_id;
 
@@ -430,11 +429,8 @@ impl ColQwen3Emb {
             }
         }
 
-        let t_tensor = Tensor::new(t_pos, &self.device)?;
-        let h_tensor = Tensor::new(h_pos, &self.device)?;
-        let w_tensor = Tensor::new(w_pos, &self.device)?;
-        let position_ids = Tensor::stack(&[t_tensor, h_tensor, w_tensor], 0)?;
-        Ok((position_ids, text_pos))
+        let _ = text_pos;
+        (t_pos, h_pos, w_pos)
     }
 
     /// Build (input_embeds, vision_mask) by:
