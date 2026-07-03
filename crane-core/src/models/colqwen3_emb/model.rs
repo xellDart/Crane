@@ -412,11 +412,13 @@ impl ColQwen3Emb {
     ///   1) ONE embed call over the whole id sequence (image_pad rows will be overwritten)
     ///   2) slice_assign of vision embeddings over the image_pad positions.
     /// Numerically equivalent to embedding text-runs and concatenating with vision blocks.
+    /// The mask stays on the host — its only consumer (deepstack scatter in
+    /// forward_hidden) needs host positions, so uploading it was a round-trip.
     fn merge_embeddings(
         &self,
         input_ids: &[u32],
         image_embeds: &Tensor,
-    ) -> candle_core::Result<(Tensor, Tensor)> {
+    ) -> candle_core::Result<(Tensor, Vec<f32>)> {
         let image_token = self.config.image_token_id;
         let num_vis_tokens = image_embeds.dim(0)?;
         let hidden_size = image_embeds.dim(1)?;
@@ -457,8 +459,7 @@ impl ColQwen3Emb {
             )?;
         }
 
-        let mask = Tensor::new(mask_vals, &self.device)?;
-        Ok((combined, mask))
+        Ok((combined, mask_vals))
     }
 
     fn preproc_params(&self) -> PreprocParams {
