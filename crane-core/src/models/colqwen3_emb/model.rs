@@ -7,6 +7,7 @@
 
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Module, Shape, Tensor, D};
+use rayon::prelude::*;
 use candle_nn::{linear, Linear, VarBuilder};
 use serde::Deserialize;
 use std::path::Path;
@@ -136,88 +137,63 @@ impl ColQwen3Emb {
 
     /// Encode a batch of images into multi-vector embeddings.
     /// Returns one tensor per image, each of shape (num_tokens, dims).
-    pub fn encode_images<P: AsRef<Path>>(&mut self, image_paths: &[P]) -> Result<Vec<Tensor>> {
-        let (pixel_values, grid_thw) = self.preprocess_images(image_paths)?;
-
-        // Vision encoder
-        let (image_embeds, deepstack_features) = self.vision.forward(&pixel_values, &grid_thw)?;
-
-        // Build visual prompt for each image
-        let grid_thw_vec = grid_thw.to_vec2::<u32>()?;
-        let merge = self.config.vision_config.spatial_merge_size as u32;
-
-        let mut all_embeddings = Vec::new();
-        let mut vis_offset = 0usize;
-
-        for grid in &grid_thw_vec {
-            let t = grid[0];
-            let h = grid[1] / merge;
-            let w = grid[2] / merge;
-            let n_vis_tokens = (t * h * w) as usize;
-
-            // Extract this image's vision embeddings
-            let img_embeds = image_embeds.narrow(0, vis_offset, n_vis_tokens)?;
-
-            // Build prompt tokens for this image
-            let prompt = self.build_visual_prompt(n_vis_tokens);
-            let input_ids = self.tokenizer.encode(prompt.as_str(), false)
-                .map_err(|e| E::msg(format!("Tokenizer: {}", e)))?
-                .get_ids().to_vec();
-
-            // Merge text+vision embeddings
-            let (input_embeds, vision_mask) = self.merge_embeddings(&input_ids, &img_embeds)?;
-
-            // M-RoPE positions
-            let (t_pos, h_pos, w_pos) =
-                self.compute_mrope_positions(&input_ids, std::slice::from_ref(grid));
-            let (cos, sin) = self.mrope.forward_positions(&t_pos, &h_pos, &w_pos)?;
-
-            // Forward through decoder (returns all hidden states)
-            let hidden = self.decoder.forward_hidden(
-                input_embeds, &cos, &sin,
-                Some(&deepstack_features), Some(&vision_mask),
-            )?;
-
-            // Project + L2 normalize
-            let proj = self.project_and_normalize(&hidden)?;
-
-            all_embeddings.push(proj.squeeze(0)?); // (seq_len, dims)
-            vis_offset += n_vis_tokens;
-        }
-
-        Ok(all_embeddings)
+    /// Decode + resize run in parallel on the CPU pool; the GPU stage runs
+    /// per image (vision forwards never mix patches from different images).
+    pub fn encode_images<P: AsRef<Path> + Sync>(&mut self, image_paths: &[P]) -> Result<Vec<Tensor>> {
+        let params = self.preproc_params();
+        let decoded: Vec<DecodedImage> = image_paths
+            .par_iter()
+            .map(|path| {
+                let img = image::open(path.as_ref())?.to_rgb8();
+                resize_image_cpu(img, params)
+            })
+            .collect::<Result<_>>()?;
+        self.encode_decoded(decoded)
     }
 
     /// Encode images from raw bytes (JPEG/PNG) into multi-vector embeddings.
     /// Avoids disk I/O — images are decoded directly from memory.
     pub fn encode_images_from_bytes(&mut self, images: &[&[u8]]) -> Result<Vec<Tensor>> {
-        let (pixel_values, grid_thw) = self.preprocess_images_from_bytes(images)?;
+        let params = self.preproc_params();
+        let decoded: Vec<DecodedImage> = images
+            .par_iter()
+            .map(|bytes| {
+                let img = image::load_from_memory(bytes)
+                    .map_err(|e| E::msg(format!("Failed to decode image: {}", e)))?
+                    .to_rgb8();
+                resize_image_cpu(img, params)
+            })
+            .collect::<Result<_>>()?;
+        self.encode_decoded(decoded)
+    }
 
-        let (image_embeds, deepstack_features) = self.vision.forward(&pixel_values, &grid_thw)?;
-
-        let grid_thw_vec = grid_thw.to_vec2::<u32>()?;
+    /// GPU stage, one image at a time: patchify → vision → decoder → project.
+    /// Identical compute graph to encoding each image in its own call, so
+    /// multi-image requests are bit-equal to N single-image requests.
+    fn encode_decoded(&mut self, decoded: Vec<DecodedImage>) -> Result<Vec<Tensor>> {
         let merge = self.config.vision_config.spatial_merge_size as u32;
+        let mut all_embeddings = Vec::with_capacity(decoded.len());
 
-        let mut all_embeddings = Vec::new();
-        let mut vis_offset = 0usize;
+        for dec in decoded {
+            let (pixel_values, grid_tensor, grid) = self.patchify_on_device(dec)?;
 
-        for grid in &grid_thw_vec {
+            let (image_embeds, deepstack_features) =
+                self.vision.forward(&pixel_values, &grid_tensor)?;
+
             let t = grid[0];
             let h = grid[1] / merge;
             let w = grid[2] / merge;
             let n_vis_tokens = (t * h * w) as usize;
-
-            let img_embeds = image_embeds.narrow(0, vis_offset, n_vis_tokens)?;
 
             let prompt = self.build_visual_prompt(n_vis_tokens);
             let input_ids = self.tokenizer.encode(prompt.as_str(), false)
                 .map_err(|e| E::msg(format!("Tokenizer: {}", e)))?
                 .get_ids().to_vec();
 
-            let (input_embeds, vision_mask) = self.merge_embeddings(&input_ids, &img_embeds)?;
+            let (input_embeds, vision_mask) = self.merge_embeddings(&input_ids, &image_embeds)?;
 
-            let (t_pos, h_pos, w_pos) =
-                self.compute_mrope_positions(&input_ids, std::slice::from_ref(grid));
+            let grid_rows = [grid.to_vec()];
+            let (t_pos, h_pos, w_pos) = self.compute_mrope_positions(&input_ids, &grid_rows);
             let (cos, sin) = self.mrope.forward_positions(&t_pos, &h_pos, &w_pos)?;
 
             let hidden = self.decoder.forward_hidden(
@@ -226,8 +202,7 @@ impl ColQwen3Emb {
             )?;
 
             let proj = self.project_and_normalize(&hidden)?;
-            all_embeddings.push(proj.squeeze(0)?);
-            vis_offset += n_vis_tokens;
+            all_embeddings.push(proj.squeeze(0)?); // (seq_len, dims)
         }
 
         Ok(all_embeddings)
@@ -486,25 +461,22 @@ impl ColQwen3Emb {
         Ok((combined, mask))
     }
 
-    /// Preprocess a single RGB image into pixel patches + grid_thw.
-    fn preprocess_one_image(
-        &self,
-        img: image::RgbImage,
-    ) -> Result<(Tensor, Tensor)> {
+    fn preproc_params(&self) -> PreprocParams {
+        PreprocParams {
+            factor: self.preproc_cfg.patch_size * self.preproc_cfg.merge_size,
+            min_pixels: self.preproc_cfg.size.shortest_edge,
+            max_pixels: self.preproc_cfg.size.longest_edge,
+        }
+    }
+
+    /// Device side of preprocessing: upload, normalize and patchify one image.
+    /// Returns (pixel_values, grid tensor (1,3), grid values on host).
+    fn patchify_on_device(&self, dec: DecodedImage) -> Result<(Tensor, Tensor, [u32; 3])> {
         let merge_size = self.preproc_cfg.merge_size;
         let patch_size = self.preproc_cfg.patch_size;
         let temporal_patch_size = self.preproc_cfg.temporal_patch_size;
-        let factor = patch_size * merge_size;
-        let min_pixels = self.preproc_cfg.size.shortest_edge;
-        let max_pixels = self.preproc_cfg.size.longest_edge;
+        let DecodedImage { raw, rh, rw } = dec;
 
-        let (w, h) = (img.width(), img.height());
-        let (rh, rw) = crate::utils::image_utils::smart_resize(
-            h as usize, w as usize, factor, min_pixels, max_pixels,
-        )?;
-        let img = image::imageops::resize(&img, rw as u32, rh as u32, image::imageops::FilterType::CatmullRom);
-
-        let raw: Vec<u8> = img.into_raw();
         let raw_tensor = Tensor::from_vec(raw, (rh, rw, 3), &Device::Cpu)?
             .permute((2, 0, 1))?
             .to_device(&self.device)?;
@@ -530,51 +502,34 @@ impl ColQwen3Emb {
             3 * temporal_patch_size * patch_size * patch_size,
         ))?.contiguous()?;
 
-        let grid = Tensor::from_vec(
-            vec![grid_t as u32, grid_h as u32, grid_w as u32],
-            (1, 3),
-            &self.device,
-        )?;
-        Ok((tensor, grid))
+        let grid = [grid_t as u32, grid_h as u32, grid_w as u32];
+        let grid_tensor = Tensor::from_vec(grid.to_vec(), (1, 3), &self.device)?;
+        Ok((tensor, grid_tensor, grid))
     }
+}
 
-    fn preprocess_images<P: AsRef<Path>>(
-        &self,
-        image_paths: &[P],
-    ) -> Result<(Tensor, Tensor)> {
-        let mut all_pixels = Vec::new();
-        let mut all_grid_thw = Vec::new();
+/// CPU-side result of decode + resize, ready for device patchify.
+struct DecodedImage {
+    raw: Vec<u8>,
+    rh: usize,
+    rw: usize,
+}
 
-        for path in image_paths {
-            let img = image::open(path.as_ref())?.to_rgb8();
-            let (pixels, grid) = self.preprocess_one_image(img)?;
-            all_pixels.push(pixels);
-            all_grid_thw.push(grid);
-        }
+#[derive(Clone, Copy)]
+struct PreprocParams {
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+}
 
-        let pixel_values = Tensor::cat(&all_pixels, 0)?;
-        let grid_thw = Tensor::cat(&all_grid_thw, 0)?;
-        Ok((pixel_values, grid_thw))
-    }
-
-    fn preprocess_images_from_bytes(
-        &self,
-        images_bytes: &[&[u8]],
-    ) -> Result<(Tensor, Tensor)> {
-        let mut all_pixels = Vec::new();
-        let mut all_grid_thw = Vec::new();
-
-        for bytes in images_bytes {
-            let img = image::load_from_memory(bytes)
-                .map_err(|e| E::msg(format!("Failed to decode image: {}", e)))?
-                .to_rgb8();
-            let (pixels, grid) = self.preprocess_one_image(img)?;
-            all_pixels.push(pixels);
-            all_grid_thw.push(grid);
-        }
-
-        let pixel_values = Tensor::cat(&all_pixels, 0)?;
-        let grid_thw = Tensor::cat(&all_grid_thw, 0)?;
-        Ok((pixel_values, grid_thw))
-    }
+/// CPU stage of preprocessing (no &self, safe to run on the rayon pool):
+/// smart_resize target dims + CatmullRom resample. Per-image work is
+/// independent, so parallel execution is bit-identical to the serial loop.
+fn resize_image_cpu(img: image::RgbImage, p: PreprocParams) -> Result<DecodedImage> {
+    let (w, h) = (img.width(), img.height());
+    let (rh, rw) = crate::utils::image_utils::smart_resize(
+        h as usize, w as usize, p.factor, p.min_pixels, p.max_pixels,
+    )?;
+    let img = image::imageops::resize(&img, rw as u32, rh as u32, image::imageops::FilterType::CatmullRom);
+    Ok(DecodedImage { raw: img.into_raw(), rh, rw })
 }
