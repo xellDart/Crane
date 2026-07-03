@@ -878,24 +878,25 @@ impl TextDecoder {
 
     /// Forward pass returning final hidden states `(B, S, H)` after the last RMSNorm.
     /// No mask is built — flash-attn-2 handles causal masking internally for prefill.
+    /// `vision_mask` is host data: the scatter needs CPU positions, so taking a
+    /// device tensor here forced a download per forward.
     pub fn forward_hidden(
         &self,
         xs: Tensor,
         cos: &Tensor,
         sin: &Tensor,
         deepstack_features: Option<&[Tensor]>,
-        vision_mask: Option<&Tensor>,
+        vision_mask: Option<&[f32]>,
     ) -> candle_core::Result<Tensor> {
         let (_b, seq_len, _) = xs.dims3()?;
 
         // Pre-compute scattered deepstack features once
-        let scattered_ds = if let (Some(ds), Some(vm)) = (deepstack_features, vision_mask) {
-            let mask_vec = vm.to_vec1::<f32>()?;
+        let scattered_ds = if let (Some(ds), Some(mask_vec)) = (deepstack_features, vision_mask) {
             let mut scattered = Vec::with_capacity(ds.len());
             for feat in ds.iter() {
                 let padded = scatter_vision_features(
                     feat,
-                    &mask_vec,
+                    mask_vec,
                     seq_len,
                     self.hidden_size,
                     self.dtype,
