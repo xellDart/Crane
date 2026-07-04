@@ -615,6 +615,14 @@ impl MRoPE {
 
 // ── Text: Attention (forward-only, no KV cache) ──────────────────────
 
+/// Descriptor for a packed (varlen) batch: several sequences concatenated
+/// along the time axis, attention block-diagonal via flash_attn_varlen.
+pub struct PackedSeqs {
+    /// Cumulative sequence lengths, u32 on device, `batch + 1` entries.
+    pub cu_seqlens: Tensor,
+    pub max_seqlen: usize,
+}
+
 struct TextAttention {
     qkv_proj: Linear, // fused QKV
     o_proj: Linear,
@@ -659,7 +667,13 @@ impl TextAttention {
         })
     }
 
-    fn forward(&self, xs: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+    fn forward(
+        &self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        packed: Option<&PackedSeqs>,
+    ) -> candle_core::Result<Tensor> {
         let (b, seq_len, _) = xs.dims3()?;
 
         // Fused Q/K/V projection
@@ -699,8 +713,21 @@ impl TextAttention {
         let v = v.contiguous()?;
 
         // SDPA in (b, seq, heads, dim); causal handled inside flash-attn.
-        let attn_output =
-            crate::fused_ops::attention::scaled_dot_product_attention_bshd(&q, &k, &v, true)?;
+        // Packed mode: sequences are concatenated on the time axis and
+        // flash_attn_varlen keeps attention block-diagonal per sequence.
+        let attn_output = if let Some(p) = packed {
+            crate::fused_ops::attention::scaled_dot_product_attention_varlen(
+                &q.squeeze(0)?,
+                &k.squeeze(0)?,
+                &v.squeeze(0)?,
+                &p.cu_seqlens,
+                p.max_seqlen,
+                true,
+            )?
+            .unsqueeze(0)?
+        } else {
+            crate::fused_ops::attention::scaled_dot_product_attention_bshd(&q, &k, &v, true)?
+        };
 
         let out = attn_output.reshape((b, seq_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out)
@@ -769,10 +796,16 @@ impl TextDecoderLayer {
         })
     }
 
-    fn forward(&self, xs: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+    fn forward(
+        &self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        packed: Option<&PackedSeqs>,
+    ) -> candle_core::Result<Tensor> {
         let residual = xs;
         let xs = self.input_ln.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, cos, sin)?;
+        let xs = self.self_attn.forward(&xs, cos, sin, packed)?;
 
         // Fused: new_residual = residual + attn_out; normalized = rmsnorm(new_residual)
         let (new_residual, h) = crate::fused_ops::fused_add_rmsnorm(
@@ -874,6 +907,11 @@ impl TextDecoder {
     /// No mask is built — flash-attn-2 handles causal masking internally for prefill.
     /// `vision_mask` is host data: the scatter needs CPU positions, so taking a
     /// device tensor here forced a download per forward.
+    ///
+    /// With `packed`, `xs`/`cos`/`sin`/`deepstack_features`/`vision_mask` hold
+    /// several sequences concatenated on the time axis; attention stays
+    /// block-diagonal per sequence and every other op is row-wise, so packing
+    /// is equivalent to running each sequence separately.
     pub fn forward_hidden(
         &self,
         xs: Tensor,
@@ -881,6 +919,7 @@ impl TextDecoder {
         sin: &Tensor,
         deepstack_features: Option<&[Tensor]>,
         vision_mask: Option<&[f32]>,
+        packed: Option<&PackedSeqs>,
     ) -> candle_core::Result<Tensor> {
         let (_b, seq_len, _) = xs.dims3()?;
 
@@ -905,7 +944,7 @@ impl TextDecoder {
 
         let mut h = xs;
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, cos, sin)?;
+            h = layer.forward(&h, cos, sin, packed)?;
             if let Some(ref scattered) = scattered_ds {
                 if i < scattered.len() {
                     h = (h + &scattered[i])?;

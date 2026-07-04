@@ -178,6 +178,42 @@ pub fn scaled_dot_product_attention_bshd(
     manual_sdpa(&qt, &kt, &vt, None)?.transpose(1, 2)
 }
 
+/// Packed variable-length attention over `(total_tokens, heads, head_dim)`
+/// with cumulative sequence lengths (`cu_seqlens`: u32, batch+1 entries).
+/// Each sequence attends only within itself (block-diagonal), causally when
+/// `causal` is set. flash-attn only — callers must gate on availability
+/// (CUDA + BF16/F16 + the `flash-attn` feature).
+pub fn scaled_dot_product_attention_varlen(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cu_seqlens: &Tensor,
+    max_seqlen: usize,
+    causal: bool,
+) -> Result<Tensor> {
+    #[cfg(feature = "flash-attn")]
+    {
+        let head_dim = q.dim(D::Minus1)?;
+        let softmax_scale = 1.0 / (head_dim as f32).sqrt();
+        return candle_flash_attn::flash_attn_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            softmax_scale,
+            causal,
+        );
+    }
+    #[cfg(not(feature = "flash-attn"))]
+    {
+        let _ = (q, k, v, cu_seqlens, max_seqlen, causal);
+        candle_core::bail!("varlen attention requires the flash-attn feature")
+    }
+}
+
 /// Scaled dot-product attention for unbatched 3D tensors (vision encoder).
 ///
 /// Inputs (3D):

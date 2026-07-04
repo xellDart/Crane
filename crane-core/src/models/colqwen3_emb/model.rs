@@ -13,7 +13,7 @@ use std::path::Path;
 use tokenizers::Tokenizer;
 
 use super::super::qwen3_vl::{
-    MRoPE, Qwen3VLConfig, TextConfig, TextDecoder, VisionConfig, VisionModel,
+    MRoPE, PackedSeqs, Qwen3VLConfig, TextConfig, TextDecoder, VisionConfig, VisionModel,
 };
 use super::super::qwen3_vl::config::PreprocessorConfig;
 
@@ -64,6 +64,10 @@ pub struct ColQwen3Emb {
     dtype: DType,
     img_mean: Tensor,
     img_std: Tensor,
+    /// Pages packed per decoder forward (varlen batching). 1 = off (bit-exact
+    /// legacy path). >1 needs flash-attn on CUDA in BF16/F16 and is
+    /// rank-preserving but not bit-exact (GEMM shapes change cuBLAS kernels).
+    decoder_batch: usize,
 }
 
 /// Query processing constants (matching Python OpsColQwen3Processor).
@@ -121,9 +125,14 @@ impl ColQwen3Emb {
         )?.reshape((3, 1, 1))?;
 
         let dims = config.dims;
-        println!("ColQwen3 embedding model loaded! dims={}", dims);
+        let decoder_batch = std::env::var("CRANE_DECODER_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        println!("ColQwen3 embedding model loaded! dims={} decoder_batch={}", dims, decoder_batch);
 
-        Ok(Self { vision, decoder, mrope, custom_text_proj, tokenizer, config, preproc_cfg, dims, device, dtype, img_mean, img_std })
+        Ok(Self { vision, decoder, mrope, custom_text_proj, tokenizer, config, preproc_cfg, dims, device, dtype, img_mean, img_std, decoder_batch })
     }
 
     /// Override the output embedding dimensions (Matryoshka truncation).
@@ -186,15 +195,20 @@ impl ColQwen3Emb {
         }
         drop(tx);
 
+        let batch_k = self.effective_decoder_batch();
         let mut prof = ProfAcc::from_env();
         let mut slots: Vec<Option<Tensor>> = std::iter::repeat_with(|| None).take(n).collect();
+        let mut pending: Vec<PreparedImage> = Vec::with_capacity(batch_k);
         loop {
             let tw = std::time::Instant::now();
             let Ok((i, dec)) = rx.recv() else { break };
             prof.t_wait += tw.elapsed().as_secs_f64();
-            let emb = self.encode_one_decoded(dec?, &mut prof)?;
-            slots[i] = Some(emb);
+            pending.push(self.prepare_image(i, dec?, &mut prof)?);
+            if pending.len() >= batch_k {
+                self.flush_pending(&mut pending, &mut slots, &mut prof)?;
+            }
         }
+        self.flush_pending(&mut pending, &mut slots, &mut prof)?;
         prof.report(n);
 
         slots
@@ -203,10 +217,28 @@ impl ColQwen3Emb {
             .collect()
     }
 
-    /// GPU stage for one image: patchify → vision → decoder → project.
-    /// Set CRANE_PROFILE=1 to accumulate a per-stage wall-clock breakdown
-    /// (adds device syncs between stages, so only use it for profiling runs).
-    fn encode_one_decoded(&mut self, dec: DecodedImage, prof: &mut ProfAcc) -> Result<Tensor> {
+    /// How many pages actually get packed per decoder forward: the configured
+    /// CRANE_DECODER_BATCH, gated on varlen flash-attn being usable.
+    fn effective_decoder_batch(&self) -> usize {
+        if self.decoder_batch <= 1 {
+            return 1;
+        }
+        let flash = cfg!(feature = "flash-attn");
+        if flash && self.device.is_cuda() && matches!(self.dtype, DType::BF16 | DType::F16) {
+            self.decoder_batch
+        } else {
+            1
+        }
+    }
+
+    /// Per-image GPU prep: patchify → vision → tokenize → merge → M-RoPE.
+    /// Vision runs strictly per image (bit-exact regardless of batching).
+    fn prepare_image(
+        &mut self,
+        index: usize,
+        dec: DecodedImage,
+        prof: &mut ProfAcc,
+    ) -> Result<PreparedImage> {
         let merge = self.config.vision_config.spatial_merge_size as u32;
 
         prof.sync(&self.device)?;
@@ -216,8 +248,7 @@ impl ColQwen3Emb {
         prof.sync(&self.device)?;
         let t1 = std::time::Instant::now();
 
-        let (image_embeds, deepstack_features) =
-            self.vision.forward(&pixel_values, &grid_tensor)?;
+        let (image_embeds, deepstack) = self.vision.forward(&pixel_values, &grid_tensor)?;
         prof.sync(&self.device)?;
         let t2 = std::time::Instant::now();
 
@@ -237,19 +268,104 @@ impl ColQwen3Emb {
         let (t_pos, h_pos, w_pos) = self.compute_mrope_positions(&input_ids, &grid_rows);
         let (cos, sin) = self.mrope.forward_positions(&t_pos, &h_pos, &w_pos)?;
         prof.sync(&self.device)?;
-        let t3 = std::time::Instant::now();
+        prof.add_prepare(t0, t1, t2, input_ids.len());
 
-        let hidden = self.decoder.forward_hidden(
-            input_embeds, &cos, &sin,
-            Some(&deepstack_features), Some(&vision_mask),
-        )?;
+        Ok(PreparedImage {
+            index,
+            seq_len: input_ids.len(),
+            input_embeds,
+            cos,
+            sin,
+            deepstack,
+            vision_mask,
+        })
+    }
 
-        let proj = self.project_and_normalize(&hidden)?;
-        let emb = proj.squeeze(0)?; // (seq_len, dims)
+    /// Run the decoder over the pending images and place outputs by index.
+    /// One image → the legacy (bit-exact) path. Several → sequences packed on
+    /// the time axis with block-diagonal varlen attention; every non-attention
+    /// op is row-wise, so packing is math-equivalent to separate forwards
+    /// (not bit-exact: GEMM shapes change which cuBLAS kernels run).
+    fn flush_pending(
+        &mut self,
+        pending: &mut Vec<PreparedImage>,
+        slots: &mut [Option<Tensor>],
+        prof: &mut ProfAcc,
+    ) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
         prof.sync(&self.device)?;
-        prof.add(t0, t1, t2, t3, input_ids.len());
+        let t_start = std::time::Instant::now();
 
-        Ok(emb)
+        if pending.len() == 1 {
+            let img = pending.pop().unwrap();
+            let hidden = self.decoder.forward_hidden(
+                img.input_embeds,
+                &img.cos,
+                &img.sin,
+                Some(&img.deepstack),
+                Some(&img.vision_mask),
+                None,
+            )?;
+            let proj = self.project_and_normalize(&hidden)?;
+            slots[img.index] = Some(proj.squeeze(0)?);
+        } else {
+            let items: Vec<PreparedImage> = pending.drain(..).collect();
+
+            let xs = Tensor::cat(&items.iter().map(|p| &p.input_embeds).collect::<Vec<_>>(), 1)?;
+            let cos = Tensor::cat(&items.iter().map(|p| &p.cos).collect::<Vec<_>>(), 0)?;
+            let sin = Tensor::cat(&items.iter().map(|p| &p.sin).collect::<Vec<_>>(), 0)?;
+
+            // Concatenated vision mask + per-level deepstack features: scatter
+            // positions and feature rows stay aligned because both follow the
+            // same image order.
+            let total: usize = items.iter().map(|p| p.seq_len).sum();
+            let mut mask: Vec<f32> = Vec::with_capacity(total);
+            for p in &items {
+                mask.extend_from_slice(&p.vision_mask);
+            }
+            let levels = items[0].deepstack.len();
+            let mut ds_packed = Vec::with_capacity(levels);
+            for l in 0..levels {
+                let feats: Vec<&Tensor> = items.iter().map(|p| &p.deepstack[l]).collect();
+                ds_packed.push(Tensor::cat(&feats, 0)?);
+            }
+
+            let mut cu: Vec<u32> = Vec::with_capacity(items.len() + 1);
+            cu.push(0);
+            let mut acc = 0u32;
+            let mut max_seqlen = 0usize;
+            for p in &items {
+                acc += p.seq_len as u32;
+                cu.push(acc);
+                max_seqlen = max_seqlen.max(p.seq_len);
+            }
+            let packed = PackedSeqs {
+                cu_seqlens: Tensor::from_vec(cu, (items.len() + 1,), &self.device)?,
+                max_seqlen,
+            };
+
+            let hidden = self.decoder.forward_hidden(
+                xs,
+                &cos,
+                &sin,
+                Some(&ds_packed),
+                Some(&mask),
+                Some(&packed),
+            )?;
+            let proj = self.project_and_normalize(&hidden)?.squeeze(0)?; // (T, dims)
+
+            let mut off = 0usize;
+            for p in &items {
+                slots[p.index] = Some(proj.narrow(0, off, p.seq_len)?);
+                off += p.seq_len;
+            }
+        }
+
+        prof.sync(&self.device)?;
+        prof.add_decode(t_start.elapsed().as_secs_f64());
+        Ok(())
     }
 
     /// Encode a batch of text queries into multi-vector embeddings.
@@ -282,7 +398,7 @@ impl ColQwen3Emb {
 
             // Forward (no vision features)
             let hidden = self.decoder.forward_hidden(
-                input_embeds, &cos, &sin, None, None,
+                input_embeds, &cos, &sin, None, None, None,
             )?;
 
             // Project + L2 normalize
@@ -560,6 +676,18 @@ struct DecodedImage {
     rw: usize,
 }
 
+/// Per-image state after vision + merge, awaiting the decoder (possibly
+/// packed with other images).
+struct PreparedImage {
+    index: usize,
+    seq_len: usize,
+    input_embeds: Tensor, // (1, S, H)
+    cos: Tensor,          // (S, rope_dim/2)
+    sin: Tensor,
+    deepstack: Vec<Tensor>, // per level: (n_vis_tokens, H)
+    vision_mask: Vec<f32>,  // len S
+}
+
 /// Per-stage wall-clock accumulator, enabled with CRANE_PROFILE=1.
 /// When disabled every call is a no-op (no device syncs added).
 struct ProfAcc {
@@ -592,12 +720,11 @@ impl ProfAcc {
         Ok(())
     }
 
-    fn add(
+    fn add_prepare(
         &mut self,
         t0: std::time::Instant,
         t1: std::time::Instant,
         t2: std::time::Instant,
-        t3: std::time::Instant,
         tokens: usize,
     ) {
         if !self.enabled {
@@ -606,9 +733,14 @@ impl ProfAcc {
         let now = std::time::Instant::now();
         self.t_patchify += t1.duration_since(t0).as_secs_f64();
         self.t_vision += t2.duration_since(t1).as_secs_f64();
-        self.t_prep += t3.duration_since(t2).as_secs_f64();
-        self.t_decoder += now.duration_since(t3).as_secs_f64();
+        self.t_prep += now.duration_since(t2).as_secs_f64();
         self.tokens += tokens;
+    }
+
+    fn add_decode(&mut self, secs: f64) {
+        if self.enabled {
+            self.t_decoder += secs;
+        }
     }
 
     fn report(&self, n_images: usize) {
