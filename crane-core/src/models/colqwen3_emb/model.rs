@@ -7,7 +7,6 @@
 
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Module, Shape, Tensor, D};
-use rayon::prelude::*;
 use candle_nn::{linear, Linear, VarBuilder};
 use serde::Deserialize;
 use std::path::Path;
@@ -137,75 +136,120 @@ impl ColQwen3Emb {
 
     /// Encode a batch of images into multi-vector embeddings.
     /// Returns one tensor per image, each of shape (num_tokens, dims).
-    /// Decode + resize run in parallel on the CPU pool; the GPU stage runs
-    /// per image (vision forwards never mix patches from different images).
+    /// Decode + resize run on the CPU pool while the GPU consumes images as
+    /// they become ready (pipelined); vision forwards never mix patches from
+    /// different images, so results are bit-equal to one-at-a-time encoding.
     pub fn encode_images<P: AsRef<Path> + Sync>(&mut self, image_paths: &[P]) -> Result<Vec<Tensor>> {
         let params = self.preproc_params();
-        let decoded: Vec<DecodedImage> = image_paths
-            .par_iter()
-            .map(|path| {
-                let img = image::open(path.as_ref())?.to_rgb8();
-                resize_image_cpu(img, params)
-            })
-            .collect::<Result<_>>()?;
-        self.encode_decoded(decoded)
+        let jobs: Vec<std::path::PathBuf> =
+            image_paths.iter().map(|p| p.as_ref().to_path_buf()).collect();
+        self.encode_pipelined(jobs, move |path| {
+            let img = image::open(&path)?.to_rgb8();
+            resize_image_cpu(img, params)
+        })
     }
 
     /// Encode images from raw bytes (JPEG/PNG) into multi-vector embeddings.
     /// Avoids disk I/O — images are decoded directly from memory.
     pub fn encode_images_from_bytes(&mut self, images: &[&[u8]]) -> Result<Vec<Tensor>> {
         let params = self.preproc_params();
-        let decoded: Vec<DecodedImage> = images
-            .par_iter()
-            .map(|bytes| {
-                let img = image::load_from_memory(bytes)
-                    .map_err(|e| E::msg(format!("Failed to decode image: {}", e)))?
-                    .to_rgb8();
-                resize_image_cpu(img, params)
-            })
-            .collect::<Result<_>>()?;
-        self.encode_decoded(decoded)
+        let jobs: Vec<Vec<u8>> = images.iter().map(|b| b.to_vec()).collect();
+        self.encode_pipelined(jobs, move |bytes| {
+            let img = image::load_from_memory(&bytes)
+                .map_err(|e| E::msg(format!("Failed to decode image: {}", e)))?
+                .to_rgb8();
+            resize_image_cpu(img, params)
+        })
     }
 
-    /// GPU stage, one image at a time: patchify → vision → decoder → project.
-    /// Identical compute graph to encoding each image in its own call, so
-    /// multi-image requests are bit-equal to N single-image requests.
-    fn encode_decoded(&mut self, decoded: Vec<DecodedImage>) -> Result<Vec<Tensor>> {
-        let merge = self.config.vision_config.spatial_merge_size as u32;
-        let mut all_embeddings = Vec::with_capacity(decoded.len());
-
-        for dec in decoded {
-            let (pixel_values, grid_tensor, grid) = self.patchify_on_device(dec)?;
-
-            let (image_embeds, deepstack_features) =
-                self.vision.forward(&pixel_values, &grid_tensor)?;
-
-            let t = grid[0];
-            let h = grid[1] / merge;
-            let w = grid[2] / merge;
-            let n_vis_tokens = (t * h * w) as usize;
-
-            let prompt = self.build_visual_prompt(n_vis_tokens);
-            let input_ids = self.tokenizer.encode(prompt.as_str(), false)
-                .map_err(|e| E::msg(format!("Tokenizer: {}", e)))?
-                .get_ids().to_vec();
-
-            let (input_embeds, vision_mask) = self.merge_embeddings(&input_ids, &image_embeds)?;
-
-            let grid_rows = [grid.to_vec()];
-            let (t_pos, h_pos, w_pos) = self.compute_mrope_positions(&input_ids, &grid_rows);
-            let (cos, sin) = self.mrope.forward_positions(&t_pos, &h_pos, &w_pos)?;
-
-            let hidden = self.decoder.forward_hidden(
-                input_embeds, &cos, &sin,
-                Some(&deepstack_features), Some(&vision_mask),
-            )?;
-
-            let proj = self.project_and_normalize(&hidden)?;
-            all_embeddings.push(proj.squeeze(0)?); // (seq_len, dims)
+    /// Producer/consumer pipeline: rayon decodes+resizes images on the CPU
+    /// pool and streams them through a bounded channel; this (GPU) thread
+    /// encodes each one as it arrives. GPU consumption order follows decode
+    /// completion, which is irrelevant to the math — every image's forward is
+    /// independent — and outputs are placed back in input order.
+    fn encode_pipelined<T, F>(&mut self, jobs: Vec<T>, decode: F) -> Result<Vec<Tensor>>
+    where
+        T: Send + 'static,
+        F: Fn(T) -> Result<DecodedImage> + Send + Sync + 'static,
+    {
+        let n = jobs.len();
+        // Bounded: at most a few decoded images (~5 MB each) wait in RAM.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Result<DecodedImage>)>(8);
+        let decode = std::sync::Arc::new(decode);
+        for (i, job) in jobs.into_iter().enumerate() {
+            let tx = tx.clone();
+            let decode = decode.clone();
+            rayon::spawn(move || {
+                // Send fails only if the receiver hung up (GPU error path).
+                let _ = tx.send((i, decode(job)));
+            });
         }
+        drop(tx);
 
-        Ok(all_embeddings)
+        let mut prof = ProfAcc::from_env();
+        let mut slots: Vec<Option<Tensor>> = std::iter::repeat_with(|| None).take(n).collect();
+        loop {
+            let tw = std::time::Instant::now();
+            let Ok((i, dec)) = rx.recv() else { break };
+            prof.t_wait += tw.elapsed().as_secs_f64();
+            let emb = self.encode_one_decoded(dec?, &mut prof)?;
+            slots[i] = Some(emb);
+        }
+        prof.report(n);
+
+        slots
+            .into_iter()
+            .map(|s| s.ok_or_else(|| E::msg("image decode task vanished")))
+            .collect()
+    }
+
+    /// GPU stage for one image: patchify → vision → decoder → project.
+    /// Set CRANE_PROFILE=1 to accumulate a per-stage wall-clock breakdown
+    /// (adds device syncs between stages, so only use it for profiling runs).
+    fn encode_one_decoded(&mut self, dec: DecodedImage, prof: &mut ProfAcc) -> Result<Tensor> {
+        let merge = self.config.vision_config.spatial_merge_size as u32;
+
+        prof.sync(&self.device)?;
+        let t0 = std::time::Instant::now();
+
+        let (pixel_values, grid_tensor, grid) = self.patchify_on_device(dec)?;
+        prof.sync(&self.device)?;
+        let t1 = std::time::Instant::now();
+
+        let (image_embeds, deepstack_features) =
+            self.vision.forward(&pixel_values, &grid_tensor)?;
+        prof.sync(&self.device)?;
+        let t2 = std::time::Instant::now();
+
+        let t = grid[0];
+        let h = grid[1] / merge;
+        let w = grid[2] / merge;
+        let n_vis_tokens = (t * h * w) as usize;
+
+        let prompt = self.build_visual_prompt(n_vis_tokens);
+        let input_ids = self.tokenizer.encode(prompt.as_str(), false)
+            .map_err(|e| E::msg(format!("Tokenizer: {}", e)))?
+            .get_ids().to_vec();
+
+        let (input_embeds, vision_mask) = self.merge_embeddings(&input_ids, &image_embeds)?;
+
+        let grid_rows = [grid.to_vec()];
+        let (t_pos, h_pos, w_pos) = self.compute_mrope_positions(&input_ids, &grid_rows);
+        let (cos, sin) = self.mrope.forward_positions(&t_pos, &h_pos, &w_pos)?;
+        prof.sync(&self.device)?;
+        let t3 = std::time::Instant::now();
+
+        let hidden = self.decoder.forward_hidden(
+            input_embeds, &cos, &sin,
+            Some(&deepstack_features), Some(&vision_mask),
+        )?;
+
+        let proj = self.project_and_normalize(&hidden)?;
+        let emb = proj.squeeze(0)?; // (seq_len, dims)
+        prof.sync(&self.device)?;
+        prof.add(t0, t1, t2, t3, input_ids.len());
+
+        Ok(emb)
     }
 
     /// Encode a batch of text queries into multi-vector embeddings.
@@ -514,6 +558,75 @@ struct DecodedImage {
     raw: Vec<u8>,
     rh: usize,
     rw: usize,
+}
+
+/// Per-stage wall-clock accumulator, enabled with CRANE_PROFILE=1.
+/// When disabled every call is a no-op (no device syncs added).
+struct ProfAcc {
+    enabled: bool,
+    t_patchify: f64,
+    t_vision: f64,
+    t_prep: f64,
+    t_decoder: f64,
+    t_wait: f64,
+    tokens: usize,
+}
+
+impl ProfAcc {
+    fn from_env() -> Self {
+        Self {
+            enabled: std::env::var("CRANE_PROFILE").map(|v| v == "1").unwrap_or(false),
+            t_patchify: 0.0,
+            t_vision: 0.0,
+            t_prep: 0.0,
+            t_decoder: 0.0,
+            t_wait: 0.0,
+            tokens: 0,
+        }
+    }
+
+    fn sync(&self, device: &Device) -> Result<()> {
+        if self.enabled {
+            device.synchronize()?;
+        }
+        Ok(())
+    }
+
+    fn add(
+        &mut self,
+        t0: std::time::Instant,
+        t1: std::time::Instant,
+        t2: std::time::Instant,
+        t3: std::time::Instant,
+        tokens: usize,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.t_patchify += t1.duration_since(t0).as_secs_f64();
+        self.t_vision += t2.duration_since(t1).as_secs_f64();
+        self.t_prep += t3.duration_since(t2).as_secs_f64();
+        self.t_decoder += now.duration_since(t3).as_secs_f64();
+        self.tokens += tokens;
+    }
+
+    fn report(&self, n_images: usize) {
+        if !self.enabled || n_images == 0 {
+            return;
+        }
+        let total = self.t_patchify + self.t_vision + self.t_prep + self.t_decoder;
+        eprintln!(
+            "CRANE_PROFILE: {} imgs, {} tokens | patchify {:.0}ms ({:.0}%) | vision {:.0}ms ({:.0}%) | tokenize+merge+rope {:.0}ms ({:.0}%) | decoder+proj {:.0}ms ({:.0}%) | decode-wait {:.0}ms | {:.0}ms/img GPU",
+            n_images, self.tokens,
+            self.t_patchify * 1e3, self.t_patchify / total * 100.0,
+            self.t_vision * 1e3, self.t_vision / total * 100.0,
+            self.t_prep * 1e3, self.t_prep / total * 100.0,
+            self.t_decoder * 1e3, self.t_decoder / total * 100.0,
+            self.t_wait * 1e3,
+            total / n_images as f64 * 1e3,
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
