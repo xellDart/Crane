@@ -300,18 +300,17 @@ impl ColQwen3Emb {
     ///
     /// Vectorized: pads all passages to max_seq_len, stacks into a single tensor,
     /// then scores all passages in one batched matmul per query chunk.
-    pub fn score(
-        qs: &[Tensor],
-        ps: &[Tensor],
-        batch_size: usize,
-    ) -> Result<Tensor> {
-        if qs.is_empty() || ps.is_empty() {
-            anyhow::bail!("Empty query or passage embeddings");
+    /// Stack per-page embeddings into the padded, transposed layout scoring
+    /// consumes: (N_pages, dims, max_sp), zero-padded to the longest page.
+    /// Callers may keep this tensor resident (e.g. a GPU cache) and score
+    /// against it repeatedly via `score_stacked` without re-stacking.
+    pub fn stack_passages(ps: &[Tensor]) -> Result<Tensor> {
+        if ps.is_empty() {
+            anyhow::bail!("Empty passage embeddings");
         }
-
-        let device = qs[0].device();
-        let dtype = qs[0].dtype();
-        let dims = qs[0].dim(D::Minus1)?;
+        let device = ps[0].device();
+        let dtype = ps[0].dtype();
+        let dims = ps[0].dim(D::Minus1)?;
 
         // Pre-allocate (N_pages, max_sp, dims) zeros and slice_assign each passage.
         // Avoids per-passage cat (which copies the full max_sp×dims block).
@@ -325,7 +324,34 @@ impl ColQwen3Emb {
             )?;
         }
         // (N_pages, dims, max_sp) for matmul
-        let ps_t = ps_stacked.transpose(1, 2)?.contiguous()?;
+        Ok(ps_stacked.transpose(1, 2)?.contiguous()?)
+    }
+
+    pub fn score(
+        qs: &[Tensor],
+        ps: &[Tensor],
+        batch_size: usize,
+    ) -> Result<Tensor> {
+        if qs.is_empty() || ps.is_empty() {
+            anyhow::bail!("Empty query or passage embeddings");
+        }
+        let ps_t = Self::stack_passages(ps)?;
+        Self::score_stacked(qs, &ps_t, batch_size)
+    }
+
+    /// Score queries against a pre-stacked passage tensor (`stack_passages`).
+    /// Same math as `score`, minus the two full-document copies the stacking
+    /// step allocates — the hot path when the stacked tensor is cached.
+    pub fn score_stacked(
+        qs: &[Tensor],
+        ps_t: &Tensor,
+        batch_size: usize,
+    ) -> Result<Tensor> {
+        if qs.is_empty() {
+            anyhow::bail!("Empty query embeddings");
+        }
+        let dims = qs[0].dim(D::Minus1)?;
+        let n_pages = ps_t.dim(0)?;
 
         let mut scores_list: Vec<Tensor> = Vec::new();
 
@@ -339,8 +365,8 @@ impl ColQwen3Emb {
 
                 // Process passages in chunks to limit VRAM
                 let mut chunk_scores = Vec::new();
-                for j in (0..ps.len()).step_by(batch_size) {
-                    let end_p = (j + batch_size).min(ps.len());
+                for j in (0..n_pages).step_by(batch_size) {
+                    let end_p = (j + batch_size).min(n_pages);
                     let ps_chunk = ps_t.narrow(0, j, end_p - j)?; // (chunk, dims, max_sp)
                     let chunk_size = end_p - j;
 
