@@ -150,6 +150,34 @@ pub fn scaled_dot_product_attention(
     manual_sdpa(q, k, v, mask)
 }
 
+/// Scaled dot-product attention taking inputs already in flash-attn's native
+/// `(B, S, H, D)` layout. Callers that keep this layout end-to-end skip the
+/// two transpose+contiguous round-trips of the `(B, H, S, D)` entry point —
+/// with flash active that saves several full-tensor copies per layer.
+///
+/// Returns `(B, S, H, D)`.
+pub fn scaled_dot_product_attention_bshd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    #[allow(unused_variables)] causal: bool,
+) -> Result<Tensor> {
+    #[cfg(feature = "flash-attn")]
+    {
+        if can_use_flash_attn(q, None) {
+            let head_dim = q.dim(D::Minus1)?;
+            let softmax_scale = 1.0 / (head_dim as f32).sqrt();
+            return candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal);
+        }
+    }
+
+    // Fallback: route through the (B, H, S, D) implementation.
+    let qt = q.transpose(1, 2)?.contiguous()?;
+    let kt = k.transpose(1, 2)?.contiguous()?;
+    let vt = v.transpose(1, 2)?.contiguous()?;
+    manual_sdpa(&qt, &kt, &vt, None)?.transpose(1, 2)
+}
+
 /// Scaled dot-product attention for unbatched 3D tensors (vision encoder).
 ///
 /// Inputs (3D):

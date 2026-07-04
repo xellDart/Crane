@@ -676,18 +676,15 @@ impl TextAttention {
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
 
-        // Transpose to (b, heads, seq, dim)
-        let q = q.transpose(1, 2)?;
-        let k = k.transpose(1, 2)?;
-        let v = v.transpose(1, 2)?;
-
-        // M-RoPE (full or partial)
+        // Everything stays in (b, seq, heads, dim) — flash-attn's native layout.
+        // rope_thd applies the same non-interleaved rotation as rope, indexed
+        // for this layout, so no transpose round-trips are needed anywhere.
         let (q, k) = if self.rope_dim < self.head_dim {
             let rd = self.rope_dim;
             let pass = self.head_dim - rd;
-            let q_r = candle_nn::rotary_emb::rope(&q.narrow(D::Minus1, 0, rd)?.contiguous()?, cos, sin)?;
+            let q_r = candle_nn::rotary_emb::rope_thd(&q.narrow(D::Minus1, 0, rd)?.contiguous()?, cos, sin)?;
             let q_p = q.narrow(D::Minus1, rd, pass)?.contiguous()?;
-            let k_r = candle_nn::rotary_emb::rope(&k.narrow(D::Minus1, 0, rd)?.contiguous()?, cos, sin)?;
+            let k_r = candle_nn::rotary_emb::rope_thd(&k.narrow(D::Minus1, 0, rd)?.contiguous()?, cos, sin)?;
             let k_p = k.narrow(D::Minus1, rd, pass)?.contiguous()?;
             (
                 Tensor::cat(&[&q_r, &q_p], D::Minus1)?,
@@ -695,20 +692,17 @@ impl TextAttention {
             )
         } else {
             (
-                candle_nn::rotary_emb::rope(&q.contiguous()?, cos, sin)?,
-                candle_nn::rotary_emb::rope(&k.contiguous()?, cos, sin)?,
+                candle_nn::rotary_emb::rope_thd(&q.contiguous()?, cos, sin)?,
+                candle_nn::rotary_emb::rope_thd(&k.contiguous()?, cos, sin)?,
             )
         };
         let v = v.contiguous()?;
 
-        // SDPA — pass mask=None so flash-attn-2 fires for prefill (causal handled internally).
+        // SDPA in (b, seq, heads, dim); causal handled inside flash-attn.
         let attn_output =
-            crate::fused_ops::attention::scaled_dot_product_attention(&q.contiguous()?, &k, &v, None, true)?;
+            crate::fused_ops::attention::scaled_dot_product_attention_bshd(&q, &k, &v, true)?;
 
-        let out = attn_output
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, seq_len, self.num_heads * self.head_dim))?;
+        let out = attn_output.reshape((b, seq_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out)
     }
 }
