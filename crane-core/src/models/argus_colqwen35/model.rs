@@ -201,11 +201,6 @@ pub struct ArgusColqwen35Emb {
     img_std: Tensor,
 }
 
-// Argus query augmentation (processing_argus.py): empty prefix + 10 <|endoftext|>.
-const QUERY_PREFIX: &str = "";
-const QUERY_AUGMENTATION_TOKEN: &str = "<|endoftext|>";
-const QUERY_AUGMENTATION_COUNT: usize = 10;
-
 impl ArgusColqwen35Emb {
     pub fn from_local(path: impl AsRef<Path>, cpu: bool, bf16: bool) -> Result<Self> {
         let device = if cpu { Device::Cpu } else { Device::cuda_if_available(0)? };
@@ -373,12 +368,19 @@ impl ArgusColqwen35Emb {
         let router_hidden = router_hidden
             .ok_or_else(|| E::msg("backbone did not return the router-layer hidden state"))?;
 
-        let fused = self.apply_region_moe(
-            &final_hidden,
-            &router_hidden,
-            &input_ids,
-            [t as usize, h_m as usize, w_m as usize],
-        )?;
+        // Isolation flag: CRANE_ARGUS_NO_MOE=1 skips the region-MoE fusion and
+        // projects the raw backbone hidden states — used to separate MoE drift
+        // from vision/backbone drift during parity validation.
+        let fused = if std::env::var("CRANE_ARGUS_NO_MOE").map(|v| v == "1").unwrap_or(false) {
+            final_hidden
+        } else {
+            self.apply_region_moe(
+                &final_hidden,
+                &router_hidden,
+                &input_ids,
+                [t as usize, h_m as usize, w_m as usize],
+            )?
+        };
 
         // Project + L2 normalize, then mask to image tokens (doc side).
         let emb = self.project_and_normalize(&fused)?.squeeze(0)?; // (seq, dims)
@@ -394,17 +396,13 @@ impl ArgusColqwen35Emb {
     // ── Query encoding ────────────────────────────────────────────────
 
     pub fn encode_queries(&mut self, queries: &[&str]) -> Result<Vec<Tensor>> {
+        // The shipped `model.encode_queries` uses `process_texts`: the raw query
+        // text tokenized with NO prefix, NO augmentation, NO special tokens.
         let mut out = Vec::new();
         for query in queries {
-            let processed = format!(
-                "{}{}{}",
-                QUERY_PREFIX,
-                query,
-                QUERY_AUGMENTATION_TOKEN.repeat(QUERY_AUGMENTATION_COUNT),
-            );
             let input_ids = self
                 .tokenizer
-                .encode(processed.as_str(), false)
+                .encode(*query, false)
                 .map_err(|e| E::msg(format!("Tokenizer: {}", e)))?
                 .get_ids()
                 .to_vec();

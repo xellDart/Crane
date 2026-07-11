@@ -390,7 +390,9 @@ impl VisionMLP {
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        // gelu_pytorch_tanh (matches the current qwen3_vl tower convention).
+        // Empirically the reference vision MLP matches the exact erf GELU
+        // (`.gelu()` tanh-approx measurably worsened parity), despite the
+        // "gelu_pytorch_tanh" label. Matches the current qwen3_vl tower.
         let x = self.fc1.forward(x)?.gelu_erf()?;
         self.fc2.forward(&x)
     }
