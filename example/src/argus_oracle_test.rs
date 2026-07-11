@@ -1,17 +1,13 @@
-//! Parity harness: validate the Rust Argus-Colqwen3.5 path against the Python
-//! oracle (modeling_argus.py via transformers 5.x).
+//! Parity harness: Rust Argus-Colqwen3.5 vs the Python oracle.
 //!
-//! Encodes the same images + queries as `argus_oracle.py` and writes the
-//! embeddings and score matrix to disk as raw f32.
+//! Encodes every image in <test_dir>/images/ (sorted) and every line in
+//! <test_dir>/queries.txt, writing raw little-endian f32 (row-major):
+//!   <test_dir>/crane_argus_image{i}.bin   (Sp, 1024)
+//!   <test_dir>/crane_argus_query{i}.bin   (Sq, 1024)
+//!   <test_dir>/crane_argus_scores.bin     (n_q, n_p)
+//!   <test_dir>/crane_argus_meta.txt
 //!
-//! Usage:
-//!   argus_oracle_test <model_path> <test_dir>
-//!
-//! Reads:  <test_dir>/images/00_white_32.png, 01_black_16.png
-//! Writes: <test_dir>/crane_argus_query{0,1}.bin  (Sq, 1024) f32 row-major
-//!         <test_dir>/crane_argus_image{0,1}.bin  (Sp, 1024)
-//!         <test_dir>/crane_argus_scores.bin      (2, 2)
-//!         <test_dir>/crane_argus_meta.txt
+//! Usage: argus_oracle_test <model_path> <test_dir>
 
 use anyhow::Result;
 use crane_core::models::argus_colqwen35::ArgusColqwen35Emb;
@@ -45,15 +41,23 @@ fn main() -> Result<()> {
     }
     let model_path = &args[1];
     let test_dir = PathBuf::from(&args[2]);
-    let img_dir = test_dir.join("images");
 
-    let queries = [
-        "Is attention really all you need?",
-        "What is the amount of bananas farmed in Salvador?",
-    ];
-    let image_paths = [img_dir.join("00_white_32.png"), img_dir.join("01_black_16.png")];
+    // Sorted image list.
+    let mut image_paths: Vec<PathBuf> = std::fs::read_dir(test_dir.join("images"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()),
+                Some(ref e) if e == "jpg" || e == "jpeg" || e == "png"
+            )
+        })
+        .collect();
+    image_paths.sort();
 
-    println!("Loading Argus-Colqwen3.5 (bf16=true)...");
+    let queries_raw = std::fs::read_to_string(test_dir.join("queries.txt"))?;
+    let queries: Vec<&str> = queries_raw.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+
+    println!("Loading Argus-Colqwen3.5 (bf16=true)... {} images, {} queries", image_paths.len(), queries.len());
     let mut model = ArgusColqwen35Emb::from_local(model_path, false, true)?;
 
     println!("Encoding queries...");
@@ -65,19 +69,19 @@ fn main() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     let mut meta = String::new();
-    let (r, c) = write_tensor_f32(&test_dir.join("crane_argus_query0.bin"), &query_embs[0])?;
-    meta.push_str(&format!("query0: ({}, {})\n", r, c));
-    let (r, c) = write_tensor_f32(&test_dir.join("crane_argus_query1.bin"), &query_embs[1])?;
-    meta.push_str(&format!("query1: ({}, {})\n", r, c));
-    let (r, c) = write_tensor_f32(&test_dir.join("crane_argus_image0.bin"), &image_embs[0])?;
-    meta.push_str(&format!("image0: ({}, {})\n", r, c));
-    let (r, c) = write_tensor_f32(&test_dir.join("crane_argus_image1.bin"), &image_embs[1])?;
-    meta.push_str(&format!("image1: ({}, {})\n", r, c));
+    for (i, q) in query_embs.iter().enumerate() {
+        let (r, c) = write_tensor_f32(&test_dir.join(format!("crane_argus_query{i}.bin")), q)?;
+        meta.push_str(&format!("query{i}: ({r}, {c})\n"));
+    }
+    for (i, im) in image_embs.iter().enumerate() {
+        let (r, c) = write_tensor_f32(&test_dir.join(format!("crane_argus_image{i}.bin")), im)?;
+        meta.push_str(&format!("image{i}: ({r}, {c})\n"));
+    }
 
     println!("Computing scores...");
     let scores = ArgusColqwen35Emb::score(&query_embs, &image_embs, 128)?;
     let (r, c) = write_tensor_f32(&test_dir.join("crane_argus_scores.bin"), &scores)?;
-    meta.push_str(&format!("scores: ({}, {})\n", r, c));
+    meta.push_str(&format!("scores: ({r}, {c})\n"));
     let scores_vec: Vec<f32> = scores.flatten_all()?.to_vec1()?;
     meta.push_str(&format!("scores_values: {:?}\n", scores_vec));
 
