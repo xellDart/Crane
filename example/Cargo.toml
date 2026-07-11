@@ -16,6 +16,10 @@ path = "src/embedding_simple.rs"
 name = "embedding_oracle_test"
 path = "src/embedding_oracle_test.rs"
 
+[[bin]]
+name = "argus_oracle_test"
+path = "src/argus_oracle_test.rs"
+
 [features]
 default = []
 cuda = ["crane-core/cuda"]
