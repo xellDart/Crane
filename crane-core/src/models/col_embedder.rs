@@ -1,9 +1,10 @@
-//! Load-time dispatch between the two ColBERT-style embedders by the model's
+//! Load-time dispatch between the ColBERT-style embedders by the model's
 //! `config.json` `model_type`:
 //!   - `ops_colqwen3` (or anything unknown/absent) → `ColQwen3Emb` (unchanged)
 //!   - `argus_colqwen35`                            → `ArgusColqwen35Emb`
+//!   - `qwen3_5` (ColQwen3_5, e.g. Vultron)         → `ColQwen3_5Emb`
 //!
-//! Both variants expose an identical public surface, so callers hold a single
+//! All variants expose an identical public surface, so callers hold a single
 //! `ColEmbedder` and never branch. The ops path delegates verbatim — no
 //! behavioral change for existing deployments.
 
@@ -13,6 +14,7 @@ use serde::Deserialize;
 use std::path::Path;
 
 use super::argus_colqwen35::ArgusColqwen35Emb;
+use super::colqwen3_5::ColQwen3_5Emb;
 use super::colqwen3_emb::ColQwen3Emb;
 
 #[derive(Deserialize)]
@@ -24,6 +26,7 @@ struct ModelTypeProbe {
 pub enum ColEmbedder {
     Ops(ColQwen3Emb),
     Argus(ArgusColqwen35Emb),
+    ColQwen3_5(ColQwen3_5Emb),
 }
 
 impl ColEmbedder {
@@ -34,6 +37,7 @@ impl ColEmbedder {
             serde_json::from_str(&std::fs::read_to_string(base.join("config.json"))?)?;
         match probe.model_type.as_str() {
             "argus_colqwen35" => Ok(Self::Argus(ArgusColqwen35Emb::from_local(base, cpu, bf16)?)),
+            "qwen3_5" => Ok(Self::ColQwen3_5(ColQwen3_5Emb::from_local(base, cpu, bf16)?)),
             // ops_colqwen3 and any legacy/unknown value keep the original path.
             _ => Ok(Self::Ops(ColQwen3Emb::from_local(base, cpu, bf16)?)),
         }
@@ -43,6 +47,7 @@ impl ColEmbedder {
         match self {
             Self::Ops(_) => "ops_colqwen3",
             Self::Argus(_) => "argus_colqwen35",
+            Self::ColQwen3_5(_) => "qwen3_5",
         }
     }
 
@@ -50,6 +55,7 @@ impl ColEmbedder {
         match self {
             Self::Ops(m) => &m.device,
             Self::Argus(m) => &m.device,
+            Self::ColQwen3_5(m) => &m.device,
         }
     }
 
@@ -57,6 +63,7 @@ impl ColEmbedder {
         match self {
             Self::Ops(m) => m.set_dims(dims),
             Self::Argus(m) => m.set_dims(dims),
+            Self::ColQwen3_5(m) => m.set_dims(dims),
         }
     }
 
@@ -64,6 +71,7 @@ impl ColEmbedder {
         match self {
             Self::Ops(m) => m.encode_images(image_paths),
             Self::Argus(m) => m.encode_images(image_paths),
+            Self::ColQwen3_5(m) => m.encode_images(image_paths),
         }
     }
 
@@ -71,6 +79,7 @@ impl ColEmbedder {
         match self {
             Self::Ops(m) => m.encode_images_from_bytes(images),
             Self::Argus(m) => m.encode_images_from_bytes(images),
+            Self::ColQwen3_5(m) => m.encode_images_from_bytes(images),
         }
     }
 
@@ -78,6 +87,7 @@ impl ColEmbedder {
         match self {
             Self::Ops(m) => m.encode_queries(queries),
             Self::Argus(m) => m.encode_queries(queries),
+            Self::ColQwen3_5(m) => m.encode_queries(queries),
         }
     }
 

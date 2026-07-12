@@ -828,6 +828,8 @@ impl GatedDeltaNet {
     }
 
     /// Depthwise causal conv1d + SiLU on `x: (B, T, C)` → `(B, T, C)` (zero left-pad).
+    /// The vectorized window-stack (broadcast_mul + sum) saturates the GPU better
+    /// than candle's grouped `conv1d` at this channel count (measured), so we keep it.
     fn apply_conv1d(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let (b, t, c) = x.dims3()?;
         let ks = self.conv_ks;
@@ -901,50 +903,22 @@ impl GatedDeltaNet {
             let decay = a_log_f.exp()?; // (H,)
             sp.broadcast_mul(&decay)?.neg()? // (B,T,H) in (-inf, 0]
         };
-        let g_exp = g.exp()?; // decay factor in [0,1]
-
-        // 7. Recurrent delta-rule scan in F32. q scaled by 1/sqrt(head_k_dim).
+        // 7. Delta-rule scan in F32. q scaled by 1/sqrt(head_k_dim).
         let scale = 1.0 / (self.head_k_dim as f64).sqrt();
-        let q = (q.to_dtype(DType::F32)? * scale)?.transpose(1, 2)?; // (B, H, T, Hk)
-        let k = k.to_dtype(DType::F32)?.transpose(1, 2)?;
-        let v = v.to_dtype(DType::F32)?.transpose(1, 2)?;
-        let g_exp = g_exp.transpose(1, 2)?; // (B, H, T)
-        let beta = beta.transpose(1, 2)?; // (B, H, T)
+        let q = (q.to_dtype(DType::F32)? * scale)?.transpose(1, 2)?.contiguous()?; // (B,H,T,Hk)
+        let k = k.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?;
+        let v = v.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?;
+        let g = g.transpose(1, 2)?.contiguous()?; // (B,H,T) raw log-decay
+        let beta = beta.transpose(1, 2)?.contiguous()?; // (B,H,T)
 
-        let mut state = Tensor::zeros(
-            (b, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-            DType::F32,
-            xs.device(),
-        )?;
-
-        let mut step_outputs = Vec::with_capacity(t);
-        for pos in 0..t {
-            let q_t = q.narrow(2, pos, 1)?.squeeze(2)?; // (B, H, Hk)
-            let k_t = k.narrow(2, pos, 1)?.squeeze(2)?;
-            let v_t = v.narrow(2, pos, 1)?.squeeze(2)?; // (B, H, Hv)
-            let g_t = g_exp.narrow(2, pos, 1)?.squeeze(2)?; // (B, H)
-            let beta_t = beta.narrow(2, pos, 1)?.squeeze(2)?; // (B, H)
-
-            let g4d = g_t.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?; // (B,H,1,1)
-            let beta2d = beta_t.unsqueeze(D::Minus1)?; // (B,H,1)
-
-            // Decay state, predict, delta-update, read out.
-            state = state.broadcast_mul(&g4d)?;
-            let kv_pred = state
-                .broadcast_mul(&k_t.unsqueeze(D::Minus1)?)?
-                .sum(D::Minus2)?; // (B,H,Hv)
-            let delta = v_t.sub(&kv_pred)?.broadcast_mul(&beta2d)?; // (B,H,Hv)
-            let outer = k_t
-                .unsqueeze(D::Minus1)?
-                .broadcast_mul(&delta.unsqueeze(D::Minus2)?)?; // (B,H,Hk,Hv)
-            state = state.add(&outer)?;
-            let out_t = state
-                .broadcast_mul(&q_t.unsqueeze(D::Minus1)?)?
-                .sum(D::Minus2)?; // (B,H,Hv)
-            step_outputs.push(out_t.unsqueeze(1)?); // (B, 1, H, Hv)
-        }
-
-        let core_out = Tensor::cat(&step_outputs, 1)?; // (B, T, H, Hv)
+        // Chunked parallel scan by default (HF's prefill path, algebraically
+        // identical); the sequential recurrent form is kept behind a flag for
+        // parity checks (CRANE_GDN_RECURRENT=1).
+        let core_out = if std::env::var("CRANE_GDN_RECURRENT").map(|s| s == "1").unwrap_or(false) {
+            self.recurrent_scan(&q, &k, &v, &g, &beta)?
+        } else {
+            self.chunk_scan(&q, &k, &v, &g, &beta)?
+        };
 
         // 8. Gated RMSNorm (per value head), then output projection.
         let bth = b * t * self.num_v_heads;
@@ -957,6 +931,174 @@ impl GatedDeltaNet {
 
         self.out_proj.forward(&normed)
     }
+
+    /// Sequential recurrent gated delta rule (F32). Mirrors HF
+    /// `torch_recurrent_gated_delta_rule`. Inputs (B,H,T,·)/(B,H,T), q pre-scaled,
+    /// `g` raw log-decay. Returns core_out (B,T,H,Hv). Kept for parity checks.
+    fn recurrent_scan(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        let (b, _h, t, _) = q.dims4()?;
+        let g_exp = g.exp()?; // (B,H,T)
+        let mut state = Tensor::zeros(
+            (b, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+            DType::F32,
+            q.device(),
+        )?;
+        let mut step_outputs = Vec::with_capacity(t);
+        for pos in 0..t {
+            let q_t = q.narrow(2, pos, 1)?.squeeze(2)?;
+            let k_t = k.narrow(2, pos, 1)?.squeeze(2)?;
+            let v_t = v.narrow(2, pos, 1)?.squeeze(2)?;
+            let g_t = g_exp.narrow(2, pos, 1)?.squeeze(2)?;
+            let beta_t = beta.narrow(2, pos, 1)?.squeeze(2)?;
+            let g4d = g_t.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
+            let beta2d = beta_t.unsqueeze(D::Minus1)?;
+            state = state.broadcast_mul(&g4d)?;
+            let kv_pred = state.broadcast_mul(&k_t.unsqueeze(D::Minus1)?)?.sum(D::Minus2)?;
+            let delta = v_t.sub(&kv_pred)?.broadcast_mul(&beta2d)?;
+            let outer = k_t.unsqueeze(D::Minus1)?.broadcast_mul(&delta.unsqueeze(D::Minus2)?)?;
+            state = state.add(&outer)?;
+            let out_t = state.broadcast_mul(&q_t.unsqueeze(D::Minus1)?)?.sum(D::Minus2)?;
+            step_outputs.push(out_t.unsqueeze(1)?); // (B,1,H,Hv)
+        }
+        Tensor::cat(&step_outputs, 1) // (B,T,H,Hv)
+    }
+
+    /// Chunked parallel gated delta rule (F32). Mirrors HF
+    /// `torch_chunk_gated_delta_rule` (chunk_size=64) — algebraically identical
+    /// to the recurrent form but processes chunks with batched matmuls instead of
+    /// a per-token loop, cutting ~T sequential steps to ~T/64 + 64. Inputs
+    /// (B,H,T,·)/(B,H,T), q pre-scaled, `g` raw log-decay. Returns (B,T,H,Hv).
+    fn chunk_scan(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        let dev = q.device();
+        let (b, h, t, hk) = q.dims4()?;
+        let hv = v.dim(3)?;
+        let c = 64usize;
+        let pad = (c - t % c) % c;
+        let tp = t + pad;
+        let nc = tp / c;
+        let bh = b * h;
+        let gg = bh * nc;
+
+        // Pad along T so the sequence splits into whole chunks.
+        let q = q.pad_with_zeros(2, 0, pad)?;
+        let k = k.pad_with_zeros(2, 0, pad)?;
+        let v = v.pad_with_zeros(2, 0, pad)?;
+        let g = g.pad_with_zeros(2, 0, pad)?; // (B,H,Tp)
+        let beta = beta.pad_with_zeros(2, 0, pad)?;
+
+        let beta_e = beta.unsqueeze(3)?; // (B,H,Tp,1)
+        let v_beta = v.broadcast_mul(&beta_e)?;
+        let k_beta = k.broadcast_mul(&beta_e)?;
+
+        let lower_incl = tri_mask(c, |i, j| i >= j, dev)?;
+        let strict_lower = tri_mask(c, |i, j| i > j, dev)?;
+        let eye = tri_mask(c, |i, j| i == j, dev)?;
+
+        // Cumulative decay within each chunk.
+        let g_cs = g.reshape((b, h, nc, c))?.cumsum(3)?; // (B,H,Nc,C)
+        let g_cs_g = g_cs.reshape((gg, c))?;
+        // decay_mask[.,i,j] = exp(g_i - g_j) for i>=j else 0 (mask the diff BEFORE
+        // exp so masked-out upper entries can't overflow to inf).
+        let diff = g_cs_g.unsqueeze(2)?.broadcast_sub(&g_cs_g.unsqueeze(1)?)?; // (G,C,C)
+        let decay_mask = diff
+            .broadcast_mul(&lower_incl)?
+            .exp()?
+            .broadcast_mul(&lower_incl)?; // (G,C,C)
+
+        // attn = -((k_beta @ key^T) * decay_mask) restricted to strict-lower.
+        let k_beta_g = k_beta.reshape((gg, c, hk))?;
+        let key_g = k.reshape((gg, c, hk))?;
+        let kk = k_beta_g.matmul(&key_g.transpose(1, 2)?.contiguous()?)?; // (G,C,C)
+        let mut attn = kk.broadcast_mul(&decay_mask)?.neg()?.broadcast_mul(&strict_lower)?;
+
+        // Forward substitution to invert (I + strictly-lower): 63 batched steps.
+        for i in 1..c {
+            let row = attn.narrow(1, i, 1)?.narrow(2, 0, i)?.contiguous()?; // (G,1,i)
+            let sub = attn.narrow(1, 0, i)?.narrow(2, 0, i)?.contiguous()?; // (G,i,i)
+            let new_row = (&row + row.matmul(&sub)?)?; // (G,1,i)
+            attn = attn.slice_assign(&[0..gg, i..i + 1, 0..i], &new_row)?;
+        }
+        let attn = attn.broadcast_add(&eye)?; // (G,C,C)
+
+        let v_beta_g = v_beta.reshape((gg, c, hv))?;
+        let u = attn.matmul(&v_beta_g)?; // (G,C,Hv) pseudo-values
+        let g_exp_col = g_cs_g.exp()?.unsqueeze(2)?; // (G,C,1)
+        let kbg = k_beta_g.broadcast_mul(&g_exp_col)?; // (G,C,Hk)
+        let k_cumdecay = attn.matmul(&kbg)?; // (G,C,Hk)
+
+        // Views for the cross-chunk recurrence: BH batch, iterate over Nc.
+        let q_c = q.reshape((bh, nc, c, hk))?;
+        let k_c = k.reshape((bh, nc, c, hk))?;
+        let u_c = u.reshape((bh, nc, c, hv))?;
+        let dm_c = decay_mask.reshape((bh, nc, c, c))?;
+        let g_c = g_cs.reshape((bh, nc, c))?;
+        let kcd_c = k_cumdecay.reshape((bh, nc, c, hk))?;
+
+        let mut state = Tensor::zeros((bh, hk, hv), DType::F32, dev)?;
+        let mut outs = Vec::with_capacity(nc);
+        for i in 0..nc {
+            let q_i = q_c.narrow(1, i, 1)?.squeeze(1)?.contiguous()?; // (BH,C,Hk)
+            let k_i = k_c.narrow(1, i, 1)?.squeeze(1)?.contiguous()?;
+            let v_i = u_c.narrow(1, i, 1)?.squeeze(1)?; // (BH,C,Hv)
+            let dm_i = dm_c.narrow(1, i, 1)?.squeeze(1)?; // (BH,C,C)
+            let g_i = g_c.narrow(1, i, 1)?.squeeze(1)?; // (BH,C)
+            let kcd_i = kcd_c.narrow(1, i, 1)?.squeeze(1)?.contiguous()?; // (BH,C,Hk)
+
+            let attn_i = q_i
+                .matmul(&k_i.transpose(1, 2)?.contiguous()?)?
+                .broadcast_mul(&dm_i)?; // (BH,C,C)
+            let v_prime = kcd_i.matmul(&state)?; // (BH,C,Hv)
+            let v_new = (v_i - v_prime)?.contiguous()?;
+            let g_i_e = g_i.exp()?.unsqueeze(2)?; // (BH,C,1)
+            let attn_inter = q_i.broadcast_mul(&g_i_e)?.contiguous()?.matmul(&state)?; // (BH,C,Hv)
+            let core_i = (attn_inter + attn_i.contiguous()?.matmul(&v_new)?)?;
+            outs.push(core_i.reshape((bh, 1, c, hv))?);
+
+            // state = state*exp(g_last) + (k_i * exp(g_last - g_i))^T @ v_new
+            let g_last = g_i.narrow(1, c - 1, 1)?; // (BH,1)
+            let g_last_e = g_last.exp()?.unsqueeze(2)?; // (BH,1,1)
+            let decay_state = state.broadcast_mul(&g_last_e)?;
+            let coef = g_last.broadcast_sub(&g_i)?.exp()?.unsqueeze(2)?; // (BH,C,1)
+            let k_scaled = k_i.broadcast_mul(&coef)?; // (BH,C,Hk)
+            let kv = k_scaled.transpose(1, 2)?.contiguous()?.matmul(&v_new)?; // (BH,Hk,Hv)
+            state = (decay_state + kv)?;
+        }
+
+        let core = Tensor::cat(&outs, 1)?.reshape((bh, tp, hv))?; // (BH,Tp,Hv)
+        let core = core.narrow(1, 0, t)?; // (BH,T,Hv)
+        core.reshape((b, h, t, hv))?.transpose(1, 2)?.contiguous() // (B,T,H,Hv)
+    }
+}
+
+/// (C,C) F32 mask, 1.0 where `keep(row, col)` else 0.0.
+fn tri_mask<F: Fn(usize, usize) -> bool>(
+    c: usize,
+    keep: F,
+    dev: &Device,
+) -> candle_core::Result<Tensor> {
+    let mut v = vec![0f32; c * c];
+    for i in 0..c {
+        for j in 0..c {
+            if keep(i, j) {
+                v[i * c + j] = 1.0;
+            }
+        }
+    }
+    Tensor::from_vec(v, (c, c), dev)
 }
 
 // ── Text: Gated full attention (partial RoPE, QK-norm, GQA) ──────────

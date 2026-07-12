@@ -7,6 +7,7 @@ edition = "2021"
 crane-core = { path = "../crane-core" }
 anyhow = "1.0.100"
 image = "0.25.9"
+serde_json = "1.0"
 
 [[bin]]
 name = "embedding_simple"
@@ -20,7 +21,19 @@ path = "src/embedding_oracle_test.rs"
 name = "argus_oracle_test"
 path = "src/argus_oracle_test.rs"
 
+[[bin]]
+name = "argus_eval"
+path = "src/argus_eval.rs"
+
+[[bin]]
+name = "col_eval"
+path = "src/col_eval.rs"
+
 [features]
 default = []
 cuda = ["crane-core/cuda"]
 flash-attn = ["cuda", "crane-core/flash-attn"]
+
+[[bin]]
+name = "gdn_parity"
+path = "src/gdn_parity.rs"
