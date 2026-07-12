@@ -1137,48 +1137,91 @@ impl GatedDeltaNet {
         let q_c = q.reshape((bh, nc, c, hk))?;
         let k_c = k.reshape((bh, nc, c, hk))?;
         let u_c = u.reshape((bh, nc, c, hv))?;
-        let dm_c = decay_mask.reshape((bh, nc, c, c))?;
         let g_c = g_cs.reshape((bh, nc, c))?;
         let kcd_c = k_cumdecay.reshape((bh, nc, c, hk))?;
 
-        let mut state = Tensor::zeros((bh, hk, hv), DType::F32, dev)?;
-        let mut outs = Vec::with_capacity(nc);
-        for i in 0..nc {
-            let q_i = q_c.narrow(1, i, 1)?.squeeze(1)?.contiguous()?; // (BH,C,Hk)
-            let k_i = k_c.narrow(1, i, 1)?.squeeze(1)?.contiguous()?;
-            let v_i = u_c.narrow(1, i, 1)?.squeeze(1)?; // (BH,C,Hv)
-            let dm_i = dm_c.narrow(1, i, 1)?.squeeze(1)?; // (BH,C,C)
-            let g_i = g_c.narrow(1, i, 1)?.squeeze(1)?; // (BH,C)
-            let kcd_i = kcd_c.narrow(1, i, 1)?.squeeze(1)?.contiguous()?; // (BH,C,Hk)
+        // Batched precompute of the state-independent per-chunk quantities, so the
+        // sequential recurrence only carries `state`.
+        let bhnc = bh * nc;
+        let qk = q_c
+            .reshape((bhnc, c, hk))?
+            .matmul(&k_c.reshape((bhnc, c, hk))?.transpose(1, 2)?.contiguous()?)?;
+        let attn_all = qk.broadcast_mul(&decay_mask)?.reshape((bh, nc, c, c))?;
+        let g_exp = g_c.exp()?; // (bh,nc,c)
+        let qg_all = q_c.broadcast_mul(&g_exp.unsqueeze(3)?)?; // q_i * exp(g_cumsum)
+        let g_last = g_c.narrow(2, c - 1, 1)?; // (bh,nc,1)
+        let glast_exp = g_last.squeeze(2)?.exp()?; // (bh,nc)
+        let coef = g_last.broadcast_sub(&g_c)?.exp()?; // (bh,nc,c)
+        let ks_all = k_c.broadcast_mul(&coef.unsqueeze(3)?)?; // k_i * exp(g_last - g_i)
 
-            let attn_i = q_i
-                .matmul(&k_i.transpose(1, 2)?.contiguous()?)?
-                .broadcast_mul(&dm_i)?; // (BH,C,C)
-            let v_prime = kcd_i.matmul(&state)?; // (BH,C,Hv)
-            let v_new = (v_i - v_prime)?.contiguous()?;
-            let g_i_e = g_i.exp()?.unsqueeze(2)?; // (BH,C,1)
-            let attn_inter = q_i.broadcast_mul(&g_i_e)?.contiguous()?.matmul(&state)?; // (BH,C,Hv)
-            let core_i = (attn_inter + attn_i.contiguous()?.matmul(&v_new)?)?;
-            outs.push(core_i.reshape((bh, 1, c, hv))?);
-
-            // state = state*exp(g_last) + (k_i * exp(g_last - g_i))^T @ v_new
-            let g_last = g_i.narrow(1, c - 1, 1)?; // (BH,1)
-            let g_last_e = g_last.exp()?.unsqueeze(2)?; // (BH,1,1)
-            let decay_state = state.broadcast_mul(&g_last_e)?;
-            let coef = g_last.broadcast_sub(&g_i)?.exp()?.unsqueeze(2)?; // (BH,C,1)
-            let k_scaled = k_i.broadcast_mul(&coef)?; // (BH,C,Hk)
-            let kv = k_scaled.transpose(1, 2)?.contiguous()?.matmul(&v_new)?; // (BH,Hk,Hv)
-            state = (decay_state + kv)?;
-        }
+        // Cross-chunk recurrence. The candle loop (cuBLAS batched matmuls) is the
+        // default and fastest here; the single-launch fused kernel
+        // (CRANE_GDN_FUSED_SCAN=1) is kept for reference but is latency-bound at
+        // this shape (low occupancy) and slower.
+        #[cfg(feature = "cuda")]
+        let core_all = if dev.is_cuda()
+            && std::env::var("CRANE_GDN_FUSED_SCAN").map(|v| v == "1").unwrap_or(false)
+        {
+            crate::fused_ops::fused_chunk_recurrence(
+                &attn_all, &qg_all, &kcd_c, &ks_all, &u_c, &glast_exp, bh, nc, c, hk, hv,
+            )?
+        } else {
+            chunk_recurrence_loop(&attn_all, &qg_all, &kcd_c, &ks_all, &u_c, &glast_exp, bh, nc, c, hk, hv, dev)?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let core_all = chunk_recurrence_loop(
+            &attn_all, &qg_all, &kcd_c, &ks_all, &u_c, &glast_exp, bh, nc, c, hk, hv, dev,
+        )?;
 
         if prof {
             dev.synchronize()?;
             gdn_prof_add("scan_chunk", _pt.elapsed().as_secs_f64());
         }
-        let core = Tensor::cat(&outs, 1)?.reshape((bh, tp, hv))?; // (BH,Tp,Hv)
+        let core = core_all.reshape((bh, tp, hv))?; // (BH,Tp,Hv)
         let core = core.narrow(1, 0, t)?; // (BH,T,Hv)
         core.reshape((b, h, t, hv))?.transpose(1, 2)?.contiguous() // (B,T,H,Hv)
     }
+}
+
+/// Candle fallback for the chunked delta-rule cross-chunk recurrence (mirrors
+/// `fused_chunk_recurrence`). Consumes the batched precomputed tensors and
+/// carries `state` sequentially. Returns core_all (BH,Nc,C,Hv).
+#[allow(clippy::too_many_arguments)]
+fn chunk_recurrence_loop(
+    attn_all: &Tensor,
+    qg_all: &Tensor,
+    kcd_c: &Tensor,
+    ks_all: &Tensor,
+    u_c: &Tensor,
+    glast_exp: &Tensor,
+    bh: usize,
+    nc: usize,
+    c: usize,
+    hk: usize,
+    hv: usize,
+    dev: &Device,
+) -> candle_core::Result<Tensor> {
+    let mut state = Tensor::zeros((bh, hk, hv), DType::F32, dev)?;
+    let mut outs = Vec::with_capacity(nc);
+    for i in 0..nc {
+        let attn_i = attn_all.narrow(1, i, 1)?.squeeze(1)?.contiguous()?; // (BH,C,C)
+        let qg_i = qg_all.narrow(1, i, 1)?.squeeze(1)?.contiguous()?; // (BH,C,Hk)
+        let kcd_i = kcd_c.narrow(1, i, 1)?.squeeze(1)?.contiguous()?; // (BH,C,Hk)
+        let ks_i = ks_all.narrow(1, i, 1)?.squeeze(1)?.contiguous()?; // (BH,C,Hk)
+        let v_i = u_c.narrow(1, i, 1)?.squeeze(1)?; // (BH,C,Hv)
+        let gl_i = glast_exp.narrow(1, i, 1)?; // (BH,1)
+
+        let v_prime = kcd_i.matmul(&state)?; // (BH,C,Hv)
+        let v_new = (v_i - v_prime)?.contiguous()?;
+        let attn_inter = qg_i.matmul(&state)?; // (BH,C,Hv)
+        let core_i = (attn_inter + attn_i.matmul(&v_new)?)?;
+        outs.push(core_i.reshape((bh, 1, c, hv))?);
+
+        let decay_state = state.broadcast_mul(&gl_i.unsqueeze(2)?)?; // *(BH,1,1)
+        let kv = ks_i.transpose(1, 2)?.contiguous()?.matmul(&v_new)?; // (BH,Hk,Hv)
+        state = (decay_state + kv)?;
+    }
+    Tensor::cat(&outs, 1) // (BH,Nc,C,Hv)
 }
 
 /// CPU/non-CUDA fallback for the chunked delta-rule intra-chunk inverse:

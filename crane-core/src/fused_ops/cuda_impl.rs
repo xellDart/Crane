@@ -838,3 +838,75 @@ pub fn fused_rmsnorm_gated(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f32)
     }
     Ok(out)
 }
+
+// =====================================================================
+// Fused chunked delta-rule cross-chunk recurrence
+// =====================================================================
+
+/// Runs the sequential nc-chunk state recurrence of the chunked gated delta
+/// rule in one kernel launch (one thread per group×output-feature).
+/// All inputs F32, contiguous. Shapes: attn (BH,Nc,C,C); qg/kcd/ks (BH,Nc,C,Hk);
+/// v (BH,Nc,C,Hv); glast (BH,Nc). Returns core (BH,Nc,C,Hv).
+#[allow(clippy::too_many_arguments)]
+pub fn fused_chunk_recurrence(
+    attn: &Tensor, qg: &Tensor, kcd: &Tensor, ks: &Tensor, v: &Tensor, glast: &Tensor,
+    bh: usize, nc: usize, c: usize, hk: usize, hv: usize,
+) -> Result<Tensor> {
+    let attn = attn.contiguous()?; let qg = qg.contiguous()?; let kcd = kcd.contiguous()?;
+    let ks = ks.contiguous()?; let v = v.contiguous()?; let glast = glast.contiguous()?;
+    let dev = match attn.device() {
+        Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("fused_chunk_recurrence: CUDA only"),
+    };
+    let func = load_func!(&dev, "fused_chunk_recurrence_f32")?;
+    let w = 32usize; // column tile width (matches kernel)
+    let cfg = LaunchConfig {
+        grid_dim: ((bh * (hv / w)) as u32, 1, 1),
+        block_dim: (256, 1, 1), // P=8 partitions x W=32 columns
+        shared_mem_bytes: ((hk * w + c * w) * 4) as u32,
+    };
+    let out = Tensor::zeros((bh, nc, c, hv), DType::F32, attn.device())?;
+    {
+        let (a_g, a_l) = attn.storage_and_layout();
+        let (qg_g, qg_l) = qg.storage_and_layout();
+        let (kcd_g, kcd_l) = kcd.storage_and_layout();
+        let (ks_g, ks_l) = ks.storage_and_layout();
+        let (v_g, v_l) = v.storage_and_layout();
+        let (gl_g, gl_l) = glast.storage_and_layout();
+        let (o_g, _) = out.storage_and_layout();
+        macro_rules! f32s {
+            ($g:expr) => {
+                match &*$g {
+                    candle_core::Storage::Cuda(cs) => match &cs.slice {
+                        CudaStorageSlice::F32(s) => s,
+                        _ => candle_core::bail!("fused_chunk_recurrence: f32 only"),
+                    },
+                    _ => unreachable!(),
+                }
+            };
+        }
+        let a_s = f32s!(a_g).slice(a_l.start_offset()..);
+        let qg_s = f32s!(qg_g).slice(qg_l.start_offset()..);
+        let kcd_s = f32s!(kcd_g).slice(kcd_l.start_offset()..);
+        let ks_s = f32s!(ks_g).slice(ks_l.start_offset()..);
+        let v_s = f32s!(v_g).slice(v_l.start_offset()..);
+        let gl_s = f32s!(gl_g).slice(gl_l.start_offset()..);
+        let o_s = f32s!(o_g);
+        let (bh_i, nc_i, c_i, hk_i, hv_i) = (bh as i32, nc as i32, c as i32, hk as i32, hv as i32);
+        let mut builder = func.builder();
+        builder.arg(&a_s);
+        builder.arg(&qg_s);
+        builder.arg(&kcd_s);
+        builder.arg(&ks_s);
+        builder.arg(&v_s);
+        builder.arg(&gl_s);
+        builder.arg(o_s);
+        builder.arg(&bh_i);
+        builder.arg(&nc_i);
+        builder.arg(&c_i);
+        builder.arg(&hk_i);
+        builder.arg(&hv_i);
+        unsafe { builder.launch(cfg) }.w()?;
+    }
+    Ok(out)
+}

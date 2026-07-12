@@ -715,3 +715,80 @@ extern "C" __global__ void fused_rmsnorm_gated(
         outr[d] = __float2bfloat16(xn * fast_silu(__bfloat162float(gr[d])));
     }
 }
+
+// =====================================================================
+// Fused chunked delta-rule cross-chunk recurrence — tiled, shared-memory state.
+// One block per (group g, column tile of width W=32). The tile's state (Hk x W)
+// and v_new (C x W) live in shared memory; blockDim=256 = P(8) partitions x W(32)
+// columns. Output column e is independent (no cross-thread reduction on outputs);
+// partitions split the a/d loops for parallelism. Grid = BH * (Hv/W).
+//   attn_all (BH,Nc,C,C), qg_all/kcd_all/ks_all (BH,Nc,C,Hk),
+//   v_all (BH,Nc,C,Hv), glast_exp (BH,Nc)  ->  core_all (BH,Nc,C,Hv)
+//   Hk<=128, C<=64, Hv % 32 == 0.
+// =====================================================================
+extern "C" __global__ void fused_chunk_recurrence_f32(
+    const float *__restrict__ attn_all,
+    const float *__restrict__ qg_all,
+    const float *__restrict__ kcd_all,
+    const float *__restrict__ ks_all,
+    const float *__restrict__ v_all,
+    const float *__restrict__ glast_exp,
+    float *__restrict__ core_all,
+    const int BH, const int Nc, const int C, const int Hk, const int Hv
+) {
+    const int W = 32;
+    const int P = blockDim.x / W;      // partitions
+    const int e = threadIdx.x % W;     // local column
+    const int p = threadIdx.x / W;     // partition
+    const int tiles = Hv / W;
+    const int g = blockIdx.x / tiles;
+    const int col0 = (blockIdx.x % tiles) * W;
+    const int ge = col0 + e;           // global column
+
+    extern __shared__ float sh[];
+    float *state = sh;                 // [Hk*W]
+    float *vnew = sh + Hk * W;         // [C*W]
+
+    for (int d = p; d < Hk; d += P) state[d * W + e] = 0.f;
+    __syncthreads();
+
+    for (int i = 0; i < Nc; ++i) {
+        const long chunk = (long)g * Nc + i;
+        const float *attn_c = attn_all + chunk * C * C;
+        const float *qg_c = qg_all + chunk * C * Hk;
+        const float *kcd_c = kcd_all + chunk * C * Hk;
+        const float *ks_c = ks_all + chunk * C * Hk;
+        const float *v_c = v_all + chunk * C * Hv;
+        float *core_c = core_all + chunk * C * Hv;
+
+        // v_new[a][e] = v[a][ge] - sum_d kcd[a][d]*state[d][e]   (a over partitions)
+        for (int a = p; a < C; a += P) {
+            const float *kcd_a = kcd_c + a * Hk;
+            float acc = 0.f;
+            for (int d = 0; d < Hk; ++d) acc += kcd_a[d] * state[d * W + e];
+            vnew[a * W + e] = v_c[a * Hv + ge] - acc;
+        }
+        __syncthreads();
+
+        // core[a][ge] = sum_d qg[a][d]*state[d][e] + sum_b attn[a][b]*vnew[b][e]
+        for (int a = p; a < C; a += P) {
+            const float *qg_a = qg_c + a * Hk;
+            float ai = 0.f;
+            for (int d = 0; d < Hk; ++d) ai += qg_a[d] * state[d * W + e];
+            const float *attn_a = attn_c + a * C;
+            float cc = ai;
+            for (int b = 0; b < C; ++b) cc += attn_a[b] * vnew[b * W + e];
+            core_c[a * Hv + ge] = cc;
+        }
+        __syncthreads(); // finish reading state before the update below overwrites it
+
+        // state[d][e] = state[d][e]*g_last + sum_a ks[a][d]*vnew[a][e]  (d over partitions)
+        const float gl = glast_exp[chunk];
+        for (int d = p; d < Hk; d += P) {
+            float kv = 0.f;
+            for (int a = 0; a < C; ++a) kv += ks_c[a * Hk + d] * vnew[a * W + e];
+            state[d * W + e] = state[d * W + e] * gl + kv;
+        }
+        __syncthreads();
+    }
+}
