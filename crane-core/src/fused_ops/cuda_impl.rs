@@ -637,3 +637,204 @@ pub fn copy_from_tensor_f32(src_tensor: &Tensor) -> Result<Tensor> {
     }
     src_tensor.contiguous()
 }
+
+// =====================================================================
+// Depthwise causal conv1d + SiLU
+// =====================================================================
+
+/// Depthwise causal conv1d (kernel_size = `weight.dim(1)`) followed by SiLU.
+/// `x`: (B, C, T) ; `weight`: (C, KS), same dtype (BF16/F32). Returns (B, C, T).
+/// One CUDA kernel instead of a per-timestep window `stack` of T slices.
+pub fn causal_conv1d_silu(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    let x = x.contiguous()?;
+    let weight = weight.contiguous()?;
+    let (b, c, t) = x.dims3()?;
+    let ks = weight.dim(1)?;
+    let total = (b * c * t) as i64;
+
+    let dev = match x.device() {
+        Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("causal_conv1d_silu: CUDA only"),
+    };
+    let fn_name = match x.dtype() {
+        DType::BF16 => "causal_conv1d_silu_bf16",
+        DType::F32 => "causal_conv1d_silu_f32",
+        dt => candle_core::bail!("causal_conv1d_silu: unsupported dtype {dt:?}"),
+    };
+    let func = load_func!(&dev, fn_name)?;
+
+    let threads = 256u32;
+    let blocks = (((total as u64 + threads as u64 - 1) / threads as u64).min(65_535)) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let out = Tensor::zeros((b, c, t), x.dtype(), x.device())?;
+    {
+        let (x_g, x_l) = x.storage_and_layout();
+        let (w_g, w_l) = weight.storage_and_layout();
+        let (o_g, _) = out.storage_and_layout();
+        let x_cuda = match &*x_g {
+            candle_core::Storage::Cuda(s) => s,
+            _ => unreachable!(),
+        };
+        let w_cuda = match &*w_g {
+            candle_core::Storage::Cuda(s) => s,
+            _ => unreachable!(),
+        };
+        let o_cuda = match &*o_g {
+            candle_core::Storage::Cuda(s) => s,
+            _ => unreachable!(),
+        };
+        let (c_i32, t_i32, ks_i32) = (c as i32, t as i32, ks as i32);
+
+        match (&x_cuda.slice, &w_cuda.slice, &o_cuda.slice) {
+            (
+                CudaStorageSlice::BF16(xs),
+                CudaStorageSlice::BF16(ws),
+                CudaStorageSlice::BF16(os),
+            ) => {
+                let xs = xs.slice(x_l.start_offset()..);
+                let ws = ws.slice(w_l.start_offset()..);
+                let mut builder = func.builder();
+                builder.arg(&xs);
+                builder.arg(&ws);
+                builder.arg(os);
+                builder.arg(&total);
+                builder.arg(&c_i32);
+                builder.arg(&t_i32);
+                builder.arg(&ks_i32);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            (CudaStorageSlice::F32(xs), CudaStorageSlice::F32(ws), CudaStorageSlice::F32(os)) => {
+                let xs = xs.slice(x_l.start_offset()..);
+                let ws = ws.slice(w_l.start_offset()..);
+                let mut builder = func.builder();
+                builder.arg(&xs);
+                builder.arg(&ws);
+                builder.arg(os);
+                builder.arg(&total);
+                builder.arg(&c_i32);
+                builder.arg(&t_i32);
+                builder.arg(&ks_i32);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            _ => candle_core::bail!("causal_conv1d_silu: x/weight/out dtype mismatch"),
+        }
+    }
+    Ok(out)
+}
+
+// =====================================================================
+// Chunked delta-rule intra-chunk inverse (forward substitution)
+// =====================================================================
+
+/// Per-group forward substitution + identity for the chunked gated delta rule.
+/// `a`: (G, C, C) f32, strictly-lower. Returns (G, C, C) f32 = inverse factor + I.
+/// One CUDA block per group does the C-step substitution in shared memory,
+/// replacing a 63-step loop of full-tensor slice_assigns.
+pub fn chunk_delta_invert(a: &Tensor, g: usize, c: usize) -> Result<Tensor> {
+    let a = a.contiguous()?;
+    if a.dtype() != DType::F32 {
+        candle_core::bail!("chunk_delta_invert: f32 only");
+    }
+    let dev = match a.device() {
+        Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("chunk_delta_invert: CUDA only"),
+    };
+    let func = load_func!(&dev, "chunk_delta_invert_f32")?;
+    let cfg = LaunchConfig {
+        grid_dim: (g as u32, 1, 1),
+        block_dim: (c as u32, 1, 1),
+        shared_mem_bytes: (c * c * 4) as u32,
+    };
+    let out = Tensor::zeros((g, c, c), DType::F32, a.device())?;
+    {
+        let (a_g, a_l) = a.storage_and_layout();
+        let (o_g, _) = out.storage_and_layout();
+        let a_cuda = match &*a_g {
+            candle_core::Storage::Cuda(s) => s,
+            _ => unreachable!(),
+        };
+        let o_cuda = match &*o_g {
+            candle_core::Storage::Cuda(s) => s,
+            _ => unreachable!(),
+        };
+        match (&a_cuda.slice, &o_cuda.slice) {
+            (CudaStorageSlice::F32(a_s), CudaStorageSlice::F32(o_s)) => {
+                let a_s = a_s.slice(a_l.start_offset()..);
+                let c_i32 = c as i32;
+                let mut builder = func.builder();
+                builder.arg(&a_s);
+                builder.arg(o_s);
+                builder.arg(&c_i32);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            _ => candle_core::bail!("chunk_delta_invert: f32 only"),
+        }
+    }
+    Ok(out)
+}
+
+// =====================================================================
+// Fused gated RMSNorm: rmsnorm(x)*weight * silu(gate)
+// =====================================================================
+
+/// `out = rmsnorm(x, weight, eps) * silu(gate)`, one kernel pass.
+/// `x` (rows, D) is upcast to f32; `gate`/`weight` are BF16; output BF16.
+pub fn fused_rmsnorm_gated(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    let x = x.to_dtype(DType::F32)?.contiguous()?;
+    let gate = gate.to_dtype(DType::BF16)?.contiguous()?;
+    let weight = weight.to_dtype(DType::BF16)?.contiguous()?;
+    let dims = x.dims();
+    let d = dims[dims.len() - 1];
+    let rows: usize = dims[..dims.len() - 1].iter().product();
+
+    let dev = match x.device() {
+        Device::Cuda(dv) => dv.clone(),
+        _ => candle_core::bail!("fused_rmsnorm_gated: CUDA only"),
+    };
+    let func = load_func!(&dev, "fused_rmsnorm_gated")?;
+    let block = 128u32.min(d as u32).max(32);
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let out = Tensor::zeros(x.shape(), DType::BF16, x.device())?;
+    {
+        let (x_g, x_l) = x.storage_and_layout();
+        let (g_g, g_l) = gate.storage_and_layout();
+        let (w_g, w_l) = weight.storage_and_layout();
+        let (o_g, _) = out.storage_and_layout();
+        let xc = match &*x_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        let gc = match &*g_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        let wc = match &*w_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        let oc = match &*o_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        match (&xc.slice, &gc.slice, &wc.slice, &oc.slice) {
+            (
+                CudaStorageSlice::F32(xs),
+                CudaStorageSlice::BF16(gs),
+                CudaStorageSlice::BF16(ws),
+                CudaStorageSlice::BF16(os),
+            ) => {
+                let xs = xs.slice(x_l.start_offset()..);
+                let gs = gs.slice(g_l.start_offset()..);
+                let ws = ws.slice(w_l.start_offset()..);
+                let (d_i32, eps_f) = (d as i32, eps);
+                let mut builder = func.builder();
+                builder.arg(&xs);
+                builder.arg(&gs);
+                builder.arg(&ws);
+                builder.arg(os);
+                builder.arg(&d_i32);
+                builder.arg(&eps_f);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            _ => candle_core::bail!("fused_rmsnorm_gated: dtype mismatch"),
+        }
+    }
+    Ok(out)
+}

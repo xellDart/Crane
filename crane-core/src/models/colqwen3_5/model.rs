@@ -227,8 +227,18 @@ impl ColQwen3_5Emb {
     fn encode_one_decoded(&mut self, dec: DecodedImage) -> Result<Tensor> {
         let merge = self.config.vision_config.spatial_merge_size as u32;
 
+        let profile = std::env::var("CRANE_PROFILE").map(|v| v == "1").unwrap_or(false);
+        if profile {
+            self.device.synchronize()?;
+        }
+        let t_start = std::time::Instant::now();
+
         let (pixel_values, grid_tensor, grid) = self.patchify_on_device(dec)?;
         let (image_embeds, _deepstack) = self.vision.forward(&pixel_values, &grid_tensor)?;
+        if profile {
+            self.device.synchronize()?;
+        }
+        let t_vis = t_start.elapsed().as_secs_f64();
 
         let t = grid[0];
         let h_m = grid[1] / merge;
@@ -249,9 +259,26 @@ impl ColQwen3_5Emb {
         let (t_pos, h_pos, w_pos) = self.compute_mrope_positions(&input_ids, &grid_rows);
         let (cos, sin) = self.mrope.forward_positions(&t_pos, &h_pos, &w_pos)?;
 
+        if profile {
+            self.device.synchronize()?;
+        }
+        let t_dec0 = std::time::Instant::now();
         let (hidden, _) = self.decoder.forward_hidden(input_embeds, &cos, &sin, None)?;
+        if profile {
+            self.device.synchronize()?;
+        }
+        let t_dec = t_dec0.elapsed().as_secs_f64();
 
         let emb = self.project_and_normalize(&hidden)?.squeeze(0)?; // (seq, dims)
+        if profile {
+            eprintln!(
+                "VULTRON_PROFILE: seq={} vision={:.0}ms decoder={:.0}ms",
+                input_ids.len(),
+                t_vis * 1e3,
+                t_dec * 1e3
+            );
+            super::super::qwen3_5_vl::gdn_prof_report();
+        }
         // colpali default keeps all tokens; only mask when explicitly enabled.
         let emb = if self.config.mask_non_image_embeddings {
             let mask = self.image_token_mask(&input_ids)?; // (seq, 1)
@@ -470,12 +497,17 @@ impl ColQwen3_5Emb {
 
     fn preproc_params(&self) -> PreprocParams {
         let factor = self.proc.patch_size * self.proc.merge_size;
+        // Deploy at max_num_visual_tokens=1792 (card); overridable via
+        // CRANE_VISUAL_TOKENS to trade a little recall for speed.
+        let max_tokens = std::env::var("CRANE_VISUAL_TOKENS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&t| t > 0)
+            .unwrap_or(MAX_NUM_VISUAL_TOKENS);
         PreprocParams {
             factor,
             min_pixels: self.proc.size.shortest_edge,
-            // Deploy at max_num_visual_tokens=1792 (card), overriding config's
-            // longest_edge (which encodes only 768 tokens).
-            max_pixels: MAX_NUM_VISUAL_TOKENS * factor * factor,
+            max_pixels: max_tokens * factor * factor,
         }
     }
 

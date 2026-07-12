@@ -592,3 +592,126 @@ extern "C" __global__ void topk_stage2_f32(
     }
 }
 
+
+// =====================================================================
+// Depthwise causal conv1d (kernel_size KS) + SiLU. Replaces the window-stack
+// (a per-timestep Tensor::stack of T slices, ~194MB/layer) with one launch.
+//   x, out: (B, C, T) contiguous ; w: (C, KS)
+//   out[b,c,t] = silu( sum_{k=0..KS-1} x[b,c,t-(KS-1)+k] * w[c,k] )   (t<0 -> 0)
+// One thread per output element (grid-stride).
+// =====================================================================
+extern "C" __global__ void causal_conv1d_silu_bf16(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w,
+    __nv_bfloat16       *__restrict__ out,
+    const long total, const int C, const int T, const int KS
+) {
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long)gridDim.x * blockDim.x) {
+        const int t = (int)(i % T);
+        const int c = (int)((i / T) % C);
+        const long base = i - t;                 // b*C*T + c*T
+        const __nv_bfloat16 *wc = w + (long)c * KS;
+        float acc = 0.f;
+        for (int k = 0; k < KS; ++k) {
+            int tt = t - (KS - 1) + k;
+            if (tt >= 0) acc += __bfloat162float(x[base + tt]) * __bfloat162float(wc[k]);
+        }
+        out[i] = __float2bfloat16(fast_silu(acc));
+    }
+}
+
+extern "C" __global__ void causal_conv1d_silu_f32(
+    const float *__restrict__ x,
+    const float *__restrict__ w,
+    float       *__restrict__ out,
+    const long total, const int C, const int T, const int KS
+) {
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long)gridDim.x * blockDim.x) {
+        const int t = (int)(i % T);
+        const int c = (int)((i / T) % C);
+        const long base = i - t;
+        const float *wc = w + (long)c * KS;
+        float acc = 0.f;
+        for (int k = 0; k < KS; ++k) {
+            int tt = t - (KS - 1) + k;
+            if (tt >= 0) acc += x[base + tt] * wc[k];
+        }
+        out[i] = fast_silu(acc);
+    }
+}
+
+// =====================================================================
+// Chunked delta-rule intra-chunk inverse (forward substitution).
+// Replaces a 63-step Python-style loop of full-tensor slice_assigns.
+// Input a (G,C,C) strictly-lower; output (G,C,C) = substituted + identity.
+// One block per group, C threads (one per column), shared C*C tile.
+//   for i in 1..C: row_i[j] = a[i,j] + sum_{k<i} a_orig[i,k]*T[k,j]   (j<i)
+//   then T += I
+// =====================================================================
+extern "C" __global__ void chunk_delta_invert_f32(
+    const float *__restrict__ a, float *__restrict__ out, const int C
+) {
+    extern __shared__ float tile[];   // C*C
+    __shared__ float row_orig[128];   // C <= 128
+    const int g = blockIdx.x;
+    const int j = threadIdx.x;        // column
+    const float *ag = a + (long)g * C * C;
+    float *og = out + (long)g * C * C;
+    for (int r = 0; r < C; ++r) tile[r * C + j] = ag[r * C + j];
+    __syncthreads();
+    for (int i = 1; i < C; ++i) {
+        if (j < i) row_orig[j] = tile[i * C + j];
+        __syncthreads();
+        if (j < i) {
+            float acc = row_orig[j];
+            for (int k = 0; k < i; ++k) acc += row_orig[k] * tile[k * C + j];
+            tile[i * C + j] = acc;
+        }
+        __syncthreads();
+    }
+    for (int r = 0; r < C; ++r)
+        og[r * C + j] = tile[r * C + j] + (r == j ? 1.0f : 0.0f);
+}
+
+// =====================================================================
+// Fused gated RMSNorm: out = rmsnorm(x)*weight * silu(gate).
+//   x: (rows, D) f32 ; gate,weight: bf16 ; out: (rows, D) bf16.
+// One block per row; block-reduces sum(x^2) over D.
+// =====================================================================
+extern "C" __global__ void fused_rmsnorm_gated(
+    const float *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ gate,
+    const __nv_bfloat16 *__restrict__ w,
+    __nv_bfloat16 *__restrict__ out,
+    const int D, const float eps
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    const float *xr = x + (long)row * D;
+    const __nv_bfloat16 *gr = gate + (long)row * D;
+    __nv_bfloat16 *outr = out + (long)row * D;
+
+    float ss = 0.f;
+    for (int d = tid; d < D; d += bs) { float v = xr[d]; ss += v * v; }
+    ss = warp_reduce_sum_f32(ss);
+    __shared__ float sh[32];
+    if ((tid & 31) == 0) sh[tid >> 5] = ss;
+    __syncthreads();
+    int nwarps = (bs + 31) / 32;
+    if (tid < 32) {
+        ss = (tid < nwarps) ? sh[tid] : 0.f;
+        ss = warp_reduce_sum_f32(ss);
+    }
+    __shared__ float inv_sh;
+    if (tid == 0) inv_sh = rsqrtf(ss / (float)D + eps);
+    __syncthreads();
+    const float inv = inv_sh;
+
+    for (int d = tid; d < D; d += bs) {
+        float xn = xr[d] * inv * __bfloat162float(w[d]);
+        outr[d] = __float2bfloat16(xn * fast_silu(__bfloat162float(gr[d])));
+    }
+}

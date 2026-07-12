@@ -11,6 +11,6 @@
 mod model;
 
 pub use model::{
-    MRoPE, Qwen35VLConfig, Qwen35VLTextConfig, Qwen35VLVisionConfig, RopeParameters, TextConfig,
-    TextDecoder, VisionConfig, VisionModel,
+    gdn_prof_report, MRoPE, Qwen35VLConfig, Qwen35VLTextConfig, Qwen35VLVisionConfig,
+    RopeParameters, TextConfig, TextDecoder, VisionConfig, VisionModel,
 };

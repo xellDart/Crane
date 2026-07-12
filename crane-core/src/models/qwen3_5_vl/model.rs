@@ -749,6 +749,13 @@ impl RmsNormGated {
 
     /// `x` and `gate`: `(.., size)`.
     fn forward(&self, x: &Tensor, gate: &Tensor) -> candle_core::Result<Tensor> {
+        // Fast path: fused rmsnorm(x)*weight*silu(gate) in one CUDA kernel.
+        #[cfg(feature = "cuda")]
+        {
+            if x.device().is_cuda() && self.out_dtype == DType::BF16 {
+                return crate::fused_ops::fused_rmsnorm_gated(x, gate, &self.weight, self.eps as f32);
+            }
+        }
         let x = x.to_dtype(DType::F32)?;
         let gate = gate.to_dtype(DType::F32)?;
         let var = x.sqr()?.mean_keepdim(D::Minus1)?;
@@ -760,6 +767,59 @@ impl RmsNormGated {
 }
 
 // ── Text: Gated Delta Net (linear attention) ─────────────────────────
+
+// ── Lightweight GDN profiler (CRANE_PROFILE=1) ───────────────────────
+thread_local! {
+    static GDN_PROF: std::cell::RefCell<Vec<(&'static str, f64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+fn gdn_prof_on() -> bool {
+    std::env::var("CRANE_PROFILE").map(|v| v == "1").unwrap_or(false)
+}
+fn gdn_prof_add(key: &'static str, s: f64) {
+    GDN_PROF.with(|m| {
+        let mut v = m.borrow_mut();
+        match v.iter_mut().find(|(k, _)| *k == key) {
+            Some(e) => e.1 += s,
+            None => v.push((key, s)),
+        }
+    });
+}
+/// Time `f` (with device syncs) under key `key` when profiling is on.
+fn gdn_time<T>(
+    dev: &Device,
+    key: &'static str,
+    f: impl FnOnce() -> candle_core::Result<T>,
+) -> candle_core::Result<T> {
+    if !gdn_prof_on() {
+        return f();
+    }
+    dev.synchronize()?;
+    let t = std::time::Instant::now();
+    let r = f()?;
+    dev.synchronize()?;
+    gdn_prof_add(key, t.elapsed().as_secs_f64());
+    Ok(r)
+}
+/// Print + reset the accumulated per-section GDN timings (call once per encode).
+pub fn gdn_prof_report() {
+    if !gdn_prof_on() {
+        return;
+    }
+    GDN_PROF.with(|m| {
+        let mut v = m.borrow_mut();
+        if v.is_empty() {
+            return;
+        }
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut line = String::from("GDN_PROF (24 layers):");
+        for (k, s) in v.iter() {
+            line.push_str(&format!(" {}={:.0}ms", k, s * 1e3));
+        }
+        eprintln!("{}", line);
+        v.clear();
+    });
+}
 
 /// Forward-only (prefill) Gated Delta Net. No conv/recurrent state is retained.
 struct GatedDeltaNet {
@@ -833,7 +893,20 @@ impl GatedDeltaNet {
     fn apply_conv1d(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let (b, t, c) = x.dims3()?;
         let ks = self.conv_ks;
-        let x_t = x.transpose(1, 2)?; // (B, C, T)
+        let x_t = x.transpose(1, 2)?.contiguous()?; // (B, C, T)
+
+        // Fast path: fused depthwise causal conv1d + SiLU in one CUDA kernel,
+        // replacing the T-slice window stack (~194MB + T launches per layer).
+        #[cfg(feature = "cuda")]
+        {
+            if x_t.device().is_cuda() && matches!(x_t.dtype(), DType::BF16 | DType::F32) {
+                let w = self.conv1d_w.to_dtype(x_t.dtype())?; // (C, ks)
+                let out = crate::fused_ops::causal_conv1d_silu(&x_t, &w)?; // (B, C, T)
+                return out.transpose(1, 2); // (B, T, C)
+            }
+        }
+
+        // Fallback (CPU / other dtypes): vectorized window stack.
         let pad = Tensor::zeros((b, c, ks - 1), x_t.dtype(), x_t.device())?;
         let x_padded = Tensor::cat(&[&pad, &x_t], 2)?; // (B, C, T + ks - 1)
 
@@ -867,13 +940,17 @@ impl GatedDeltaNet {
         let (b, t, _) = xs.dims3()?;
 
         // 1. Projections.
-        let qkv = self.in_proj_qkv.forward(xs)?; // (B, T, conv_dim)
-        let z = self.in_proj_z.forward(xs)?; // (B, T, value_dim)
-        let b_proj = self.in_proj_b.forward(xs)?; // (B, T, num_v_heads)
-        let a_proj = self.in_proj_a.forward(xs)?; // (B, T, num_v_heads)
+        let (qkv, z, b_proj, a_proj) = gdn_time(xs.device(), "in_proj", || {
+            Ok((
+                self.in_proj_qkv.forward(xs)?,
+                self.in_proj_z.forward(xs)?,
+                self.in_proj_b.forward(xs)?,
+                self.in_proj_a.forward(xs)?,
+            ))
+        })?;
 
         // 2. Causal short conv + SiLU.
-        let qkv = self.apply_conv1d(&qkv)?;
+        let qkv = gdn_time(xs.device(), "conv1d", || self.apply_conv1d(&qkv))?;
 
         // 3. Split Q, K, V.
         let q = qkv.narrow(2, 0, self.key_dim)?;
@@ -914,11 +991,13 @@ impl GatedDeltaNet {
         // Chunked parallel scan by default (HF's prefill path, algebraically
         // identical); the sequential recurrent form is kept behind a flag for
         // parity checks (CRANE_GDN_RECURRENT=1).
-        let core_out = if std::env::var("CRANE_GDN_RECURRENT").map(|s| s == "1").unwrap_or(false) {
-            self.recurrent_scan(&q, &k, &v, &g, &beta)?
-        } else {
-            self.chunk_scan(&q, &k, &v, &g, &beta)?
-        };
+        let core_out = gdn_time(xs.device(), "scan", || {
+            if std::env::var("CRANE_GDN_RECURRENT").map(|s| s == "1").unwrap_or(false) {
+                self.recurrent_scan(&q, &k, &v, &g, &beta)
+            } else {
+                self.chunk_scan(&q, &k, &v, &g, &beta)
+            }
+        })?;
 
         // 8. Gated RMSNorm (per value head), then output projection.
         let bth = b * t * self.num_v_heads;
@@ -926,10 +1005,10 @@ impl GatedDeltaNet {
         let z_flat = z
             .reshape((b * t, self.num_v_heads, self.head_v_dim))?
             .reshape((bth, self.head_v_dim))?;
-        let normed = self.norm.forward(&co_flat, &z_flat)?; // (B*T*H, Hv)
+        let normed = gdn_time(xs.device(), "gated_norm", || self.norm.forward(&co_flat, &z_flat))?;
         let normed = normed.reshape((b, t, self.value_dim))?;
 
-        self.out_proj.forward(&normed)
+        gdn_time(xs.device(), "out_proj", || self.out_proj.forward(&normed))
     }
 
     /// Sequential recurrent gated delta rule (F32). Mirrors HF
@@ -984,6 +1063,8 @@ impl GatedDeltaNet {
         beta: &Tensor,
     ) -> candle_core::Result<Tensor> {
         let dev = q.device();
+        let prof = gdn_prof_on();
+        let mut _pt = std::time::Instant::now();
         let (b, h, t, hk) = q.dims4()?;
         let hv = v.dim(3)?;
         let c = 64usize;
@@ -1023,16 +1104,28 @@ impl GatedDeltaNet {
         let k_beta_g = k_beta.reshape((gg, c, hk))?;
         let key_g = k.reshape((gg, c, hk))?;
         let kk = k_beta_g.matmul(&key_g.transpose(1, 2)?.contiguous()?)?; // (G,C,C)
-        let mut attn = kk.broadcast_mul(&decay_mask)?.neg()?.broadcast_mul(&strict_lower)?;
+        let attn0 = kk.broadcast_mul(&decay_mask)?.neg()?.broadcast_mul(&strict_lower)?;
 
-        // Forward substitution to invert (I + strictly-lower): 63 batched steps.
-        for i in 1..c {
-            let row = attn.narrow(1, i, 1)?.narrow(2, 0, i)?.contiguous()?; // (G,1,i)
-            let sub = attn.narrow(1, 0, i)?.narrow(2, 0, i)?.contiguous()?; // (G,i,i)
-            let new_row = (&row + row.matmul(&sub)?)?; // (G,1,i)
-            attn = attn.slice_assign(&[0..gg, i..i + 1, 0..i], &new_row)?;
+        if prof {
+            dev.synchronize()?;
+            gdn_prof_add("scan_prep", _pt.elapsed().as_secs_f64());
+            _pt = std::time::Instant::now();
         }
-        let attn = attn.broadcast_add(&eye)?; // (G,C,C)
+        // Intra-chunk inverse via forward substitution. CUDA path runs one
+        // shared-memory kernel per group; otherwise a slice_assign loop.
+        #[cfg(feature = "cuda")]
+        let attn = if dev.is_cuda() {
+            crate::fused_ops::chunk_delta_invert(&attn0, gg, c)?
+        } else {
+            substitute_fallback(attn0, gg, c, &eye)?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let attn = substitute_fallback(attn0, gg, c, &eye)?;
+        if prof {
+            dev.synchronize()?;
+            gdn_prof_add("scan_subst", _pt.elapsed().as_secs_f64());
+            _pt = std::time::Instant::now();
+        }
 
         let v_beta_g = v_beta.reshape((gg, c, hv))?;
         let u = attn.matmul(&v_beta_g)?; // (G,C,Hv) pseudo-values
@@ -1078,10 +1171,31 @@ impl GatedDeltaNet {
             state = (decay_state + kv)?;
         }
 
+        if prof {
+            dev.synchronize()?;
+            gdn_prof_add("scan_chunk", _pt.elapsed().as_secs_f64());
+        }
         let core = Tensor::cat(&outs, 1)?.reshape((bh, tp, hv))?; // (BH,Tp,Hv)
         let core = core.narrow(1, 0, t)?; // (BH,T,Hv)
         core.reshape((b, h, t, hv))?.transpose(1, 2)?.contiguous() // (B,T,H,Hv)
     }
+}
+
+/// CPU/non-CUDA fallback for the chunked delta-rule intra-chunk inverse:
+/// sequential forward substitution + identity via slice_assign.
+fn substitute_fallback(
+    mut attn: Tensor,
+    gg: usize,
+    c: usize,
+    eye: &Tensor,
+) -> candle_core::Result<Tensor> {
+    for i in 1..c {
+        let row = attn.narrow(1, i, 1)?.narrow(2, 0, i)?.contiguous()?; // (G,1,i)
+        let sub = attn.narrow(1, 0, i)?.narrow(2, 0, i)?.contiguous()?; // (G,i,i)
+        let new_row = (&row + row.matmul(&sub)?)?; // (G,1,i)
+        attn = attn.slice_assign(&[0..gg, i..i + 1, 0..i], &new_row)?;
+    }
+    attn.broadcast_add(eye)
 }
 
 /// (C,C) F32 mask, 1.0 where `keep(row, col)` else 0.0.
@@ -1291,14 +1405,14 @@ impl FullDecoderLayer {
     fn forward(&self, xs: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
         let residual = xs;
         let xs = self.input_ln.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, cos, sin)?;
+        let xs = gdn_time(xs.device(), "full_attn", || self.self_attn.forward(&xs, cos, sin))?;
         let (new_residual, h) = crate::fused_ops::fused_add_rmsnorm(
             residual,
             &xs,
             &self.post_attn_ln_weight,
             self.rms_norm_eps,
         )?;
-        let h = self.mlp.forward(&h)?;
+        let h = gdn_time(h.device(), "mlp", || self.mlp.forward(&h))?;
         &new_residual + h
     }
 }
@@ -1335,7 +1449,7 @@ impl LinearDecoderLayer {
             &self.post_attn_ln_weight,
             self.rms_norm_eps,
         )?;
-        let h = self.mlp.forward(&h)?;
+        let h = gdn_time(h.device(), "mlp", || self.mlp.forward(&h))?;
         &new_residual + h
     }
 }
