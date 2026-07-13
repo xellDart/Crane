@@ -846,3 +846,59 @@ extern "C" __global__ void quant_e4m3_bf16(
         y[i] = (__nv_fp8_e4m3)(__bfloat162float(x[i]) * inv);
     }
 }
+
+// =====================================================================
+// FP8 activation quant, fully on-device (no host sync): compute per-tensor
+// absmax over bf16 x, then quantize to E4M3 and emit the activation scale.
+// =====================================================================
+extern "C" __global__ void set_zero_f32(float *p) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) p[0] = 0.0f;
+}
+
+__device__ __forceinline__ void atomic_max_f32(float *addr, float val) {
+    // Valid for non-negative values: int ordering matches float ordering.
+    int *ia = (int *)addr;
+    int old = *ia, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(ia, assumed,
+                        __float_as_int(fmaxf(__int_as_float(assumed), val)));
+    } while (assumed != old);
+}
+
+// amax[0] = max_i |x[i]| (x bf16). Caller zeroes amax first (set_zero_f32).
+extern "C" __global__ void absmax_bf16(const __nv_bfloat16 *__restrict__ x,
+                                       float *__restrict__ amax, const long n) {
+    float local = 0.0f;
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long)gridDim.x * blockDim.x) {
+        local = fmaxf(local, fabsf(__bfloat162float(x[i])));
+    }
+    for (int o = 16; o > 0; o >>= 1)
+        local = fmaxf(local, __shfl_down_sync(0xffffffff, local, o));
+    __shared__ float sh[32];
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = local;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        int nw = (blockDim.x + 31) / 32;
+        float v = (threadIdx.x < nw) ? sh[threadIdx.x] : 0.0f;
+        for (int o = 16; o > 0; o >>= 1)
+            v = fmaxf(v, __shfl_down_sync(0xffffffff, v, o));
+        if (threadIdx.x == 0) atomic_max_f32(amax, v);
+    }
+}
+
+// y = e4m3(x * 448/amax); a_scale[0] = amax/448 (for cuBLASLt to multiply back).
+extern "C" __global__ void quant_e4m3_dev(const __nv_bfloat16 *__restrict__ x,
+                                          __nv_fp8_e4m3 *__restrict__ y,
+                                          const float *__restrict__ amax,
+                                          float *__restrict__ a_scale,
+                                          const long n) {
+    const float am = amax[0];
+    const float inv = am > 0.0f ? 448.0f / am : 0.0f;
+    const long g = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g == 0) a_scale[0] = am > 0.0f ? am / 448.0f : 1.0f;
+    for (long i = g; i < n; i += (long)gridDim.x * blockDim.x) {
+        y[i] = (__nv_fp8_e4m3)(__bfloat162float(x[i]) * inv);
+    }
+}

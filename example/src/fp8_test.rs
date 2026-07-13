@@ -23,7 +23,7 @@ fn bench(dev: &Device, name: &str, t: usize, in_dim: usize, out_dim: usize) -> R
 
     // FP8 path
     let (w_fp8, w_scale) = crane_core::fused_ops::fp8::quantize_weight_e4m3(&wf)?;
-    let y_fp8 = crane_core::fused_ops::fp8::fp8_linear(&x, &w_fp8, w_scale)?;
+    let y_fp8 = crane_core::fused_ops::fp8::fp8_linear(&x, &w_fp8, &w_scale)?;
 
     let c = cos(&y_ref, &y_fp8)?;
 
@@ -40,7 +40,7 @@ fn bench(dev: &Device, name: &str, t: usize, in_dim: usize, out_dim: usize) -> R
     dev.synchronize()?;
     let t1 = std::time::Instant::now();
     for _ in 0..iters {
-        let _ = crane_core::fused_ops::fp8::fp8_linear(&x, &w_fp8, w_scale)?;
+        let _ = crane_core::fused_ops::fp8::fp8_linear(&x, &w_fp8, &w_scale)?;
     }
     dev.synchronize()?;
     let fp8_ms = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;

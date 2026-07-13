@@ -889,6 +889,61 @@ pub fn absmax_f32(x: &Tensor) -> Result<f32> {
     m.to_dtype(DType::F32)?.to_scalar::<f32>()
 }
 
+/// Fully on-device FP8 activation quant (no host sync): computes per-tensor absmax
+/// of bf16 `x`, quantizes to E4M3, and writes the activation scale into `a_scale`
+/// (a `[1]` f32 tensor read by cuBLASLt). `amax` is a `[1]` f32 scratch tensor.
+/// Returns a contiguous F8E4M3 tensor of the same shape as `x`. All on one stream.
+pub fn quantize_activation_dev(x: &Tensor, amax: &Tensor, a_scale: &Tensor) -> Result<Tensor> {
+    let x = x.to_dtype(DType::BF16)?.contiguous()?;
+    let n = x.elem_count() as i64;
+    let dev = match x.device() {
+        Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("quantize_activation_dev: CUDA only"),
+    };
+    let out = Tensor::zeros(x.shape(), DType::F8E4M3, x.device())?;
+
+    let f_zero = load_func!(&dev, "set_zero_f32")?;
+    let f_amax = load_func!(&dev, "absmax_bf16")?;
+    let f_quant = load_func!(&dev, "quant_e4m3_dev")?;
+
+    let threads = 256u32;
+    let blocks = (((n as u64 + threads as u64 - 1) / threads as u64).min(65_535)) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let cfg1 = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // Storage guards scoped so they release before `out` is returned.
+    {
+        let (x_g, x_l) = x.storage_and_layout();
+        let (o_g, _) = out.storage_and_layout();
+        let (am_g, _) = amax.storage_and_layout();
+        let (as_g, _) = a_scale.storage_and_layout();
+        let xc = match &*x_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        let oc = match &*o_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        let amc = match &*am_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        let asc = match &*as_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        let xs = match &xc.slice { CudaStorageSlice::BF16(s) => s.slice(x_l.start_offset()..), _ => candle_core::bail!("qad: x bf16") };
+        let os = match &oc.slice { CudaStorageSlice::F8E4M3(s) => s, _ => candle_core::bail!("qad: out f8") };
+        let am = match &amc.slice { CudaStorageSlice::F32(s) => s, _ => candle_core::bail!("qad: amax f32") };
+        let asf = match &asc.slice { CudaStorageSlice::F32(s) => s, _ => candle_core::bail!("qad: a_scale f32") };
+
+        // 1. zero amax
+        { let mut b = f_zero.builder(); b.arg(am); unsafe { b.launch(cfg1) }.w()?; }
+        // 2. absmax
+        { let mut b = f_amax.builder(); b.arg(&xs); b.arg(am); b.arg(&n); unsafe { b.launch(cfg) }.w()?; }
+        // 3. quantize + emit scale
+        { let mut b = f_quant.builder(); b.arg(&xs); b.arg(os); b.arg(am); b.arg(asf); b.arg(&n); unsafe { b.launch(cfg) }.w()?; }
+    }
+    Ok(out)
+}
+
 // =====================================================================
 // GDN scan glue: chunk decay mask + negated strict-lower masked product
 // =====================================================================
