@@ -21,7 +21,9 @@ fn main() -> Result<()> {
     let model_path = &args[1];
     let eval_dir = PathBuf::from(&args[2]);
 
-    let root: Value = serde_json::from_str(&std::fs::read_to_string(eval_dir.join("queries.json"))?)?;
+    // Optional 4th arg: alternate queries filename (relative to eval_dir).
+    let queries_file = args.get(4).map(|s| s.as_str()).unwrap_or("queries.json");
+    let root: Value = serde_json::from_str(&std::fs::read_to_string(eval_dir.join(queries_file))?)?;
     let documents = root["documents"].as_array().context("no documents")?;
 
     println!("Loading model from {} ...", model_path);

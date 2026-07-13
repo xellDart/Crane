@@ -840,6 +840,56 @@ pub fn fused_rmsnorm_gated(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f32)
 }
 
 // =====================================================================
+// FP8 W8A8 quantization: bf16 -> E4M3 with scalar reciprocal scale
+// =====================================================================
+
+/// Quantize a bf16 tensor to F8E4M3: `out = e4m3(x * inv)`. `inv = 448/absmax`.
+/// Returns a contiguous F8E4M3 tensor of the same shape.
+pub fn quantize_e4m3(x: &Tensor, inv: f32) -> Result<Tensor> {
+    let x = x.to_dtype(DType::BF16)?.contiguous()?;
+    let n = x.elem_count() as i64;
+    let dev = match x.device() {
+        Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("quantize_e4m3: CUDA only"),
+    };
+    let func = load_func!(&dev, "quant_e4m3_bf16")?;
+    let threads = 256u32;
+    let blocks = (((n as u64 + threads as u64 - 1) / threads as u64).min(65_535)) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let out = Tensor::zeros(x.shape(), DType::F8E4M3, x.device())?;
+    {
+        let (x_g, x_l) = x.storage_and_layout();
+        let (o_g, _) = out.storage_and_layout();
+        let xc = match &*x_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        let oc = match &*o_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        match (&xc.slice, &oc.slice) {
+            (CudaStorageSlice::BF16(xs), CudaStorageSlice::F8E4M3(os)) => {
+                let xs = xs.slice(x_l.start_offset()..);
+                let mut builder = func.builder();
+                builder.arg(&xs);
+                builder.arg(os);
+                builder.arg(&inv);
+                builder.arg(&n);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            _ => candle_core::bail!("quantize_e4m3: expected bf16 in, f8e4m3 out"),
+        }
+    }
+    Ok(out)
+}
+
+/// Per-tensor absmax of a tensor as f32 (host scalar). Reduces in the input dtype
+/// (avoids a full F32 upcast copy of the activations) and upcasts only the scalar.
+pub fn absmax_f32(x: &Tensor) -> Result<f32> {
+    let m = x.abs()?.flatten_all()?.max(0)?;
+    m.to_dtype(DType::F32)?.to_scalar::<f32>()
+}
+
+// =====================================================================
 // GDN scan glue: chunk decay mask + negated strict-lower masked product
 // =====================================================================
 

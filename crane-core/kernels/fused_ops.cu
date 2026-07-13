@@ -12,6 +12,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
 
 // =====================================================================
@@ -828,5 +829,20 @@ extern "C" __global__ void fused_chunk_recurrence_f32(
             state[d * W + e] = state[d * W + e] * gl + kv;
         }
         __syncthreads();
+    }
+}
+
+// =====================================================================
+// FP8 W8A8 quantization: bf16 -> E4M3 with a scalar reciprocal scale.
+//   y[i] = (__nv_fp8_e4m3)( bf16_to_f32(x[i]) * inv )   where inv = 448/absmax.
+// Used to quantize both activations (per-forward) and weights (offline).
+// =====================================================================
+extern "C" __global__ void quant_e4m3_bf16(
+    const __nv_bfloat16 *__restrict__ x, __nv_fp8_e4m3 *__restrict__ y,
+    const float inv, const long n
+) {
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long)gridDim.x * blockDim.x) {
+        y[i] = (__nv_fp8_e4m3)(__bfloat162float(x[i]) * inv);
     }
 }

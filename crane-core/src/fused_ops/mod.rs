@@ -19,6 +19,8 @@ mod cuda_impl;
 #[cfg(feature = "cuda")]
 pub use cuda_impl::*;
 
+pub mod fp8;
+
 // ── Non-CUDA fallbacks ──────────────────────────────────────────────
 
 #[cfg(not(feature = "cuda"))]
