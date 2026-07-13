@@ -786,6 +786,12 @@ fn gdn_prof_on() -> bool {
 fn gdn_bf16_on() -> bool {
     std::env::var("CRANE_GDN_BF16").map(|v| v != "0").unwrap_or(true)
 }
+/// Whether the MLP projections run in FP8 W8A8 (cuBLASLt). Off by default —
+/// opt in with `CRANE_FP8=1`. Weights are quantized once at load.
+#[cfg(feature = "cuda")]
+fn fp8_enabled() -> bool {
+    std::env::var("CRANE_FP8").map(|v| v == "1").unwrap_or(false)
+}
 fn gdn_prof_add(key: &'static str, s: f64) {
     GDN_PROF.with(|m| {
         let mut v = m.borrow_mut();
@@ -1446,10 +1452,21 @@ impl TextAttention {
 
 // ── Text: MLP (SwiGLU, fused gate+up) ────────────────────────────────
 
+/// FP8-quantized MLP weights (built once at load when CRANE_FP8=1).
+#[cfg(feature = "cuda")]
+struct Fp8Mlp {
+    gu_w: Tensor,
+    gu_scale: Tensor,
+    down_w: Tensor,
+    down_scale: Tensor,
+}
+
 struct TextMLP {
     gate_up_proj: Linear,
     down_proj: Linear,
     intermediate_size: usize,
+    #[cfg(feature = "cuda")]
+    fp8: Option<Fp8Mlp>,
 }
 
 impl TextMLP {
@@ -1459,14 +1476,46 @@ impl TextMLP {
         let gate_proj = linear_no_bias(h, i, vb.pp("gate_proj"))?;
         let up_proj = linear_no_bias(h, i, vb.pp("up_proj"))?;
         let gu_w = Tensor::cat(&[gate_proj.weight(), up_proj.weight()], 0)?;
+        let down_proj = linear_no_bias(i, h, vb.pp("down_proj"))?;
+
+        #[cfg(feature = "cuda")]
+        {
+            if fp8_enabled() && gu_w.device().is_cuda() {
+                let (guq, gus) = crate::fused_ops::fp8::quantize_weight_e4m3(&gu_w)?;
+                let (dq, ds) =
+                    crate::fused_ops::fp8::quantize_weight_e4m3(down_proj.weight())?;
+                // Drop the bf16 weights (replace with 1-elem dummies) — the FP8 copies
+                // are half the size, so the model footprint DROPS. Keeping both would
+                // add ~5GB and thrash the allocator (slows even the GDN scan).
+                let dummy = Tensor::zeros((1, 1), gu_w.dtype(), gu_w.device())?;
+                return Ok(Self {
+                    gate_up_proj: Linear::new(dummy.clone(), None),
+                    down_proj: Linear::new(dummy, None),
+                    intermediate_size: i,
+                    fp8: Some(Fp8Mlp { gu_w: guq, gu_scale: gus, down_w: dq, down_scale: ds }),
+                });
+            }
+        }
+
         Ok(Self {
             gate_up_proj: Linear::new(gu_w, None),
-            down_proj: linear_no_bias(i, h, vb.pp("down_proj"))?,
+            down_proj,
             intermediate_size: i,
+            #[cfg(feature = "cuda")]
+            fp8: None,
         })
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(f) = &self.fp8 {
+                let gu = crate::fused_ops::fp8::fp8_linear(x, &f.gu_w, &f.gu_scale)?;
+                let activated =
+                    crate::fused_ops::fused_silu_mul(&gu.contiguous()?, self.intermediate_size)?;
+                return crate::fused_ops::fp8::fp8_linear(&activated, &f.down_w, &f.down_scale);
+            }
+        }
         let gu = self.gate_up_proj.forward(x)?;
         #[cfg(feature = "cuda")]
         {
