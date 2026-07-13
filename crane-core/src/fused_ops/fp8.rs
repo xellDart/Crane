@@ -27,7 +27,16 @@ mod cuda {
     use std::ffi::c_void;
 
     const E4M3_MAX: f32 = 448.0;
-    const WS_SIZE: usize = 32 * 1024 * 1024;
+
+    /// cuBLASLt workspace bytes (env CRANE_FP8_WS = MB, default 32).
+    fn ws_size() -> usize {
+        std::env::var("CRANE_FP8_WS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(32)
+            * 1024
+            * 1024
+    }
 
     thread_local! {
         static LT: std::cell::RefCell<Option<LtCtx>> = const { std::cell::RefCell::new(None) };
@@ -45,6 +54,7 @@ mod cuda {
     struct LtCtx {
         handle: sys::cublasLtHandle_t,
         ws: candle_core::cuda_backend::cudarc::driver::CudaSlice<u8>,
+        ws_bytes: usize,
         a_scale: Tensor, // [1] f32, activation scale (written on-device each call)
         amax: Tensor,    // [1] f32 scratch
         plans: HashMap<(usize, usize, usize), Plan>,
@@ -114,11 +124,34 @@ mod cuda {
             {
                 let mut ctx = cell.borrow_mut();
                 if ctx.is_none() {
+                    // Raise the async-alloc pool release threshold to max so freed
+                    // per-layer temporaries stay CACHED in the pool instead of being
+                    // returned to the OS on each free (the default threshold is 0, and
+                    // that release is a synchronizing op — with the FP8 path churning
+                    // large buffers every layer it serialized the whole model, slowing
+                    // even the GDN scan by ~60ms/page).
+                    unsafe {
+                        use candle_core::cuda_backend::cudarc::driver::sys as dsys;
+                        let cud = stream.context().cu_device();
+                        let mut pool = std::mem::MaybeUninit::uninit();
+                        if dsys::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), cud)
+                            == dsys::CUresult::CUDA_SUCCESS
+                        {
+                            let pool = pool.assume_init();
+                            let thr: u64 = u64::MAX;
+                            let _ = dsys::cuMemPoolSetAttribute(
+                                pool,
+                                dsys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                                &thr as *const u64 as *mut std::ffi::c_void,
+                            );
+                        }
+                    }
                     let handle = result::create_handle().map_err(w)?;
-                    let ws = stream.alloc_zeros::<u8>(WS_SIZE).map_err(w)?;
+                    let wsb = ws_size();
+                    let ws = stream.alloc_zeros::<u8>(wsb).map_err(w)?;
                     let a_scale = Tensor::zeros((1,), DType::F32, x2p.device())?;
                     let amax = Tensor::zeros((1,), DType::F32, x2p.device())?;
-                    *ctx = Some(LtCtx { handle, ws, a_scale, amax, plans: HashMap::new() });
+                    *ctx = Some(LtCtx { handle, ws, ws_bytes: wsb, a_scale, amax, plans: HashMap::new() });
                 }
             }
             // Clone the cached scale/scratch handles (Arc — share storage) so the
@@ -135,7 +168,7 @@ mod cuda {
             let ctx = ctx.as_mut().unwrap();
             let key = (t, out_dim, in_dim);
             if !ctx.plans.contains_key(&key) {
-                let plan = build_plan(ctx.handle, t, out_dim, in_dim)?;
+                let plan = build_plan(ctx.handle, ctx.ws_bytes, t, out_dim, in_dim)?;
                 ctx.plans.insert(key, plan);
             }
             let plan = *ctx.plans.get(&key).unwrap();
@@ -212,7 +245,7 @@ mod cuda {
                     plan.d_layout,
                     &plan.algo as *const _,
                     ws_ptr as *mut c_void,
-                    WS_SIZE,
+                    ctx.ws_bytes,
                     stream.cu_stream() as *mut _,
                 )
                 .map_err(|e| w(format!("matmul: {e:?}")))?;
@@ -221,7 +254,7 @@ mod cuda {
         })
     }
 
-    fn build_plan(handle: sys::cublasLtHandle_t, t: usize, out_dim: usize, in_dim: usize) -> Result<Plan> {
+    fn build_plan(handle: sys::cublasLtHandle_t, ws_bytes: usize, t: usize, out_dim: usize, in_dim: usize) -> Result<Plan> {
         let k = in_dim as u64;
         unsafe {
             let a_layout =
@@ -241,7 +274,6 @@ mod cuda {
             set(desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast)?;
 
             let pref = result::create_matmul_pref().map_err(w)?;
-            let ws_bytes: usize = WS_SIZE;
             result::set_matmul_pref_attribute(
                 pref,
                 sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
