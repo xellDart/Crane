@@ -776,6 +776,14 @@ thread_local! {
 fn gdn_prof_on() -> bool {
     std::env::var("CRANE_PROFILE").map(|v| v == "1").unwrap_or(false)
 }
+/// Whether the cross-chunk scan GEMMs + state recurrence run in bf16 (tensor-core)
+/// instead of F32. Decay math (cumsum/exp/decay_mask) and the intra-chunk inverse
+/// stay F32. Saves ~36ms/page but drifts a few L2-normalized token vectors
+/// (global cos ~0.998 vs F32), so it is **off by default** on this quality-first
+/// retrieval model — opt in with `CRANE_GDN_BF16=1`.
+fn gdn_bf16_on() -> bool {
+    std::env::var("CRANE_GDN_BF16").map(|v| v == "1").unwrap_or(false)
+}
 fn gdn_prof_add(key: &'static str, s: f64) {
     GDN_PROF.with(|m| {
         let mut v = m.borrow_mut();
@@ -1133,39 +1141,55 @@ impl GatedDeltaNet {
             _pt = std::time::Instant::now();
         }
 
+        // Cross-chunk GEMMs + the state recurrence run in `mm` (bf16 tensor-core when
+        // enabled, else F32). The win (~36ms/page) comes from the bf16 recurrence
+        // loop; the trade-off is per-token drift (a few L2-normalized token vectors
+        // degrade, cos ~0.998 global vs F32). Decay math (exp/cumsum/decay_mask) and
+        // the intra-chunk inverse stay F32. OFF by default — opt in with
+        // CRANE_GDN_BF16=1. `mm == F32` reproduces the old path byte-for-byte.
+        let mm = if dev.is_cuda() && gdn_bf16_on() { DType::BF16 } else { DType::F32 };
+
         let v_beta_g = v_beta.reshape((gg, c, hv))?;
-        let u = attn.matmul(&v_beta_g)?; // (G,C,Hv) pseudo-values
-        let g_exp_col = g_cs_g.exp()?.unsqueeze(2)?; // (G,C,1)
-        let kbg = k_beta_g.broadcast_mul(&g_exp_col)?; // (G,C,Hk)
-        let k_cumdecay = attn.matmul(&kbg)?; // (G,C,Hk)
+        let attn_mm = attn.to_dtype(mm)?;
+        let u = attn_mm.matmul(&v_beta_g.to_dtype(mm)?)?; // (G,C,Hv) pseudo-values, mm
+        let g_exp_col = g_cs_g.exp()?.unsqueeze(2)?; // (G,C,1) F32
+        let kbg = k_beta_g.broadcast_mul(&g_exp_col)?; // (G,C,Hk) F32
+        let k_cumdecay = attn_mm.matmul(&kbg.to_dtype(mm)?)?; // (G,C,Hk) mm
 
         // Views for the cross-chunk recurrence: BH batch, iterate over Nc.
         let q_c = q.reshape((bh, nc, c, hk))?;
         let k_c = k.reshape((bh, nc, c, hk))?;
-        let u_c = u.reshape((bh, nc, c, hv))?;
+        let u_c = u.reshape((bh, nc, c, hv))?; // mm
         let g_c = g_cs.reshape((bh, nc, c))?;
-        let kcd_c = k_cumdecay.reshape((bh, nc, c, hk))?;
+        let kcd_c = k_cumdecay.reshape((bh, nc, c, hk))?; // mm
 
         // Batched precompute of the state-independent per-chunk quantities, so the
-        // sequential recurrence only carries `state`.
+        // sequential recurrence only carries `state`. Decay scalings are applied in
+        // F32, then cast to `mm` for the recurrence matmuls.
         let bhnc = bh * nc;
         let qk = q_c
             .reshape((bhnc, c, hk))?
-            .matmul(&k_c.reshape((bhnc, c, hk))?.transpose(1, 2)?.contiguous()?)?;
-        let attn_all = qk.broadcast_mul(&decay_mask)?.reshape((bh, nc, c, c))?;
-        let g_exp = g_c.exp()?; // (bh,nc,c)
-        let qg_all = q_c.broadcast_mul(&g_exp.unsqueeze(3)?)?; // q_i * exp(g_cumsum)
+            .to_dtype(mm)?
+            .matmul(&k_c.reshape((bhnc, c, hk))?.transpose(1, 2)?.contiguous()?.to_dtype(mm)?)?;
+        let attn_all = qk
+            .to_dtype(DType::F32)?
+            .broadcast_mul(&decay_mask)?
+            .reshape((bh, nc, c, c))?
+            .to_dtype(mm)?;
+        let g_exp = g_c.exp()?; // (bh,nc,c) F32
+        let qg_all = q_c.broadcast_mul(&g_exp.unsqueeze(3)?)?.to_dtype(mm)?; // q_i * exp(g_cumsum)
         let g_last = g_c.narrow(2, c - 1, 1)?; // (bh,nc,1)
-        let glast_exp = g_last.squeeze(2)?.exp()?; // (bh,nc)
-        let coef = g_last.broadcast_sub(&g_c)?.exp()?; // (bh,nc,c)
-        let ks_all = k_c.broadcast_mul(&coef.unsqueeze(3)?)?; // k_i * exp(g_last - g_i)
+        let glast_exp = g_last.squeeze(2)?.exp()?.to_dtype(mm)?; // (bh,nc)
+        let coef = g_last.broadcast_sub(&g_c)?.exp()?; // (bh,nc,c) F32
+        let ks_all = k_c.broadcast_mul(&coef.unsqueeze(3)?)?.to_dtype(mm)?; // k_i * exp(g_last - g_i)
 
         // Cross-chunk recurrence. The candle loop (cuBLAS batched matmuls) is the
         // default and fastest here; the single-launch fused kernel
-        // (CRANE_GDN_FUSED_SCAN=1) is kept for reference but is latency-bound at
-        // this shape (low occupancy) and slower.
+        // (CRANE_GDN_FUSED_SCAN=1, F32-only) is kept for reference but is
+        // latency-bound at this shape (low occupancy) and slower.
         #[cfg(feature = "cuda")]
         let core_all = if dev.is_cuda()
+            && mm == DType::F32
             && std::env::var("CRANE_GDN_FUSED_SCAN").map(|v| v == "1").unwrap_or(false)
         {
             crate::fused_ops::fused_chunk_recurrence(
@@ -1185,7 +1209,10 @@ impl GatedDeltaNet {
         }
         let core = core_all.reshape((bh, tp, hv))?; // (BH,Tp,Hv)
         let core = core.narrow(1, 0, t)?; // (BH,T,Hv)
-        core.reshape((b, h, t, hv))?.transpose(1, 2)?.contiguous() // (B,T,H,Hv)
+        core.reshape((b, h, t, hv))?
+            .transpose(1, 2)?
+            .contiguous()?
+            .to_dtype(DType::F32) // (B,T,H,Hv), F32 for the gated norm downstream
     }
 }
 
@@ -1207,7 +1234,9 @@ fn chunk_recurrence_loop(
     hv: usize,
     dev: &Device,
 ) -> candle_core::Result<Tensor> {
-    let mut state = Tensor::zeros((bh, hk, hv), DType::F32, dev)?;
+    // State carries the recurrence in the matmul dtype (bf16 or F32) so every
+    // matmul below stays same-dtype; inputs are pre-cast by the caller.
+    let mut state = Tensor::zeros((bh, hk, hv), attn_all.dtype(), dev)?;
     let mut outs = Vec::with_capacity(nc);
     for i in 0..nc {
         let attn_i = attn_all.narrow(1, i, 1)?.squeeze(1)?.contiguous()?; // (BH,C,C)
