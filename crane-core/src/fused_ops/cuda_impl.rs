@@ -840,6 +840,107 @@ pub fn fused_rmsnorm_gated(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f32)
 }
 
 // =====================================================================
+// GDN scan glue: chunk decay mask + negated strict-lower masked product
+// =====================================================================
+
+/// `decay_mask[g,i,j] = (i>=j) ? exp(g_cs[g,i] - g_cs[g,j]) : 0`, one kernel pass.
+/// `g_cs`: (G, C) f32 within-chunk cumulative log-decay. Returns (G, C, C) f32.
+/// Fuses candle's broadcast_sub -> mask -> exp -> mask chain (drops the (G,C,C)
+/// `diff` intermediate).
+pub fn gdn_decay_mask(g_cs: &Tensor, g: usize, c: usize) -> Result<Tensor> {
+    let g_cs = g_cs.contiguous()?;
+    if g_cs.dtype() != DType::F32 {
+        candle_core::bail!("gdn_decay_mask: f32 only");
+    }
+    let dev = match g_cs.device() {
+        Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("gdn_decay_mask: CUDA only"),
+    };
+    let func = load_func!(&dev, "gdn_decay_mask_f32")?;
+    let total = (g * c * c) as i64;
+    let threads = 256u32;
+    let blocks = (((total as u64 + threads as u64 - 1) / threads as u64).min(65_535)) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let out = Tensor::zeros((g, c, c), DType::F32, g_cs.device())?;
+    {
+        let (x_g, x_l) = g_cs.storage_and_layout();
+        let (o_g, _) = out.storage_and_layout();
+        let xc = match &*x_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        let oc = match &*o_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        match (&xc.slice, &oc.slice) {
+            (CudaStorageSlice::F32(xs), CudaStorageSlice::F32(os)) => {
+                let xs = xs.slice(x_l.start_offset()..);
+                let c_i32 = c as i32;
+                let mut builder = func.builder();
+                builder.arg(&xs);
+                builder.arg(os);
+                builder.arg(&total);
+                builder.arg(&c_i32);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            _ => candle_core::bail!("gdn_decay_mask: f32 only"),
+        }
+    }
+    Ok(out)
+}
+
+/// `out[g,i,j] = (i>j) ? -(kk[g,i,j] * decay[g,i,j]) : 0`, one kernel pass.
+/// `kk`, `decay`: (G, C, C) f32. Fuses candle's broadcast_mul -> neg -> broadcast_mul.
+pub fn gdn_neg_lower_mul(kk: &Tensor, decay: &Tensor) -> Result<Tensor> {
+    let kk = kk.contiguous()?;
+    let decay = decay.contiguous()?;
+    if kk.dtype() != DType::F32 || decay.dtype() != DType::F32 {
+        candle_core::bail!("gdn_neg_lower_mul: f32 only");
+    }
+    let (g, c, c2) = kk.dims3()?;
+    if c != c2 {
+        candle_core::bail!("gdn_neg_lower_mul: kk must be (G,C,C)");
+    }
+    let dev = match kk.device() {
+        Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("gdn_neg_lower_mul: CUDA only"),
+    };
+    let func = load_func!(&dev, "gdn_neg_lower_mul_f32")?;
+    let total = (g * c * c) as i64;
+    let threads = 256u32;
+    let blocks = (((total as u64 + threads as u64 - 1) / threads as u64).min(65_535)) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let out = Tensor::zeros((g, c, c), DType::F32, kk.device())?;
+    {
+        let (k_g, k_l) = kk.storage_and_layout();
+        let (d_g, d_l) = decay.storage_and_layout();
+        let (o_g, _) = out.storage_and_layout();
+        let kc = match &*k_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        let dc = match &*d_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        let oc = match &*o_g { candle_core::Storage::Cuda(s) => s, _ => unreachable!() };
+        match (&kc.slice, &dc.slice, &oc.slice) {
+            (CudaStorageSlice::F32(ks), CudaStorageSlice::F32(ds), CudaStorageSlice::F32(os)) => {
+                let ks = ks.slice(k_l.start_offset()..);
+                let ds = ds.slice(d_l.start_offset()..);
+                let c_i32 = c as i32;
+                let mut builder = func.builder();
+                builder.arg(&ks);
+                builder.arg(&ds);
+                builder.arg(os);
+                builder.arg(&total);
+                builder.arg(&c_i32);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            _ => candle_core::bail!("gdn_neg_lower_mul: f32 only"),
+        }
+    }
+    Ok(out)
+}
+
+// =====================================================================
 // Fused chunked delta-rule cross-chunk recurrence
 // =====================================================================
 

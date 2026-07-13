@@ -717,6 +717,44 @@ extern "C" __global__ void fused_rmsnorm_gated(
 }
 
 // =====================================================================
+// GDN scan glue: chunk decay mask.
+//   g_cs: (G,C) within-chunk cumulative log-decay.
+//   out : (G,C,C), out[g,i,j] = (i>=j) ? exp(g_cs[g,i] - g_cs[g,j]) : 0.
+// Replaces candle's broadcast_sub -> mask -> exp -> mask chain (4 launches +
+// a (G,C,C) `diff` intermediate) with one grid-stride pass reading only (G,C).
+// =====================================================================
+extern "C" __global__ void gdn_decay_mask_f32(
+    const float *__restrict__ g_cs, float *__restrict__ out,
+    const long total, const int C
+) {
+    for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += (long)gridDim.x * blockDim.x) {
+        const int j = (int)(idx % C);
+        const int i = (int)((idx / C) % C);
+        const long g = idx / ((long)C * C);
+        const float *gg = g_cs + g * C;
+        out[idx] = (i >= j) ? expf(gg[i] - gg[j]) : 0.0f;
+    }
+}
+
+// =====================================================================
+// GDN scan glue: negated strict-lower masked product.
+//   kk, decay: (G,C,C).  out[g,i,j] = (i>j) ? -(kk*decay) : 0.
+// Replaces candle's broadcast_mul -> neg -> broadcast_mul (3 launches).
+// =====================================================================
+extern "C" __global__ void gdn_neg_lower_mul_f32(
+    const float *__restrict__ kk, const float *__restrict__ decay,
+    float *__restrict__ out, const long total, const int C
+) {
+    for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += (long)gridDim.x * blockDim.x) {
+        const int j = (int)(idx % C);
+        const int i = (int)((idx / C) % C);
+        out[idx] = (i > j) ? -(kk[idx] * decay[idx]) : 0.0f;
+    }
+}
+
+// =====================================================================
 // Fused chunked delta-rule cross-chunk recurrence — tiled, shared-memory state.
 // One block per (group g, column tile of width W=32). The tile's state (Hk x W)
 // and v_new (C x W) live in shared memory; blockDim=256 = P(8) partitions x W(32)

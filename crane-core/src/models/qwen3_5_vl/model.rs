@@ -1085,26 +1085,28 @@ impl GatedDeltaNet {
         let v_beta = v.broadcast_mul(&beta_e)?;
         let k_beta = k.broadcast_mul(&beta_e)?;
 
-        let lower_incl = tri_mask(c, |i, j| i >= j, dev)?;
-        let strict_lower = tri_mask(c, |i, j| i > j, dev)?;
-        let eye = tri_mask(c, |i, j| i == j, dev)?;
-
         // Cumulative decay within each chunk.
         let g_cs = g.reshape((b, h, nc, c))?.cumsum(3)?; // (B,H,Nc,C)
         let g_cs_g = g_cs.reshape((gg, c))?;
-        // decay_mask[.,i,j] = exp(g_i - g_j) for i>=j else 0 (mask the diff BEFORE
-        // exp so masked-out upper entries can't overflow to inf).
-        let diff = g_cs_g.unsqueeze(2)?.broadcast_sub(&g_cs_g.unsqueeze(1)?)?; // (G,C,C)
-        let decay_mask = diff
-            .broadcast_mul(&lower_incl)?
-            .exp()?
-            .broadcast_mul(&lower_incl)?; // (G,C,C)
 
-        // attn = -((k_beta @ key^T) * decay_mask) restricted to strict-lower.
+        // attn0 = -((k_beta @ key^T) * decay_mask) on strict-lower, where
+        // decay_mask[.,i,j] = exp(g_i - g_j) for i>=j else 0. decay_mask is reused
+        // below for attn_all. On CUDA the mask/exp/neg glue (7 elementwise launches
+        // over (G,C,C) + a `diff` intermediate) collapses into two grid-stride kernels.
         let k_beta_g = k_beta.reshape((gg, c, hk))?;
         let key_g = k.reshape((gg, c, hk))?;
         let kk = k_beta_g.matmul(&key_g.transpose(1, 2)?.contiguous()?)?; // (G,C,C)
-        let attn0 = kk.broadcast_mul(&decay_mask)?.neg()?.broadcast_mul(&strict_lower)?;
+
+        #[cfg(feature = "cuda")]
+        let (decay_mask, attn0) = if dev.is_cuda() {
+            let dm = crate::fused_ops::gdn_decay_mask(&g_cs_g, gg, c)?;
+            let a0 = crate::fused_ops::gdn_neg_lower_mul(&kk, &dm)?;
+            (dm, a0)
+        } else {
+            decay_mask_attn0_fallback(&g_cs_g, &kk, c, dev)?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let (decay_mask, attn0) = decay_mask_attn0_fallback(&g_cs_g, &kk, c, dev)?;
 
         if prof {
             dev.synchronize()?;
@@ -1117,10 +1119,14 @@ impl GatedDeltaNet {
         let attn = if dev.is_cuda() {
             crate::fused_ops::chunk_delta_invert(&attn0, gg, c)?
         } else {
+            let eye = tri_mask(c, |i, j| i == j, dev)?;
             substitute_fallback(attn0, gg, c, &eye)?
         };
         #[cfg(not(feature = "cuda"))]
-        let attn = substitute_fallback(attn0, gg, c, &eye)?;
+        let attn = {
+            let eye = tri_mask(c, |i, j| i == j, dev)?;
+            substitute_fallback(attn0, gg, c, &eye)?
+        };
         if prof {
             dev.synchronize()?;
             gdn_prof_add("scan_subst", _pt.elapsed().as_secs_f64());
@@ -1222,6 +1228,31 @@ fn chunk_recurrence_loop(
         state = (decay_state + kv)?;
     }
     Tensor::cat(&outs, 1) // (BH,Nc,C,Hv)
+}
+
+/// Candle fallback for the GDN decay-mask + strict-lower `attn0` glue (the CUDA
+/// path fuses this into `gdn_decay_mask` + `gdn_neg_lower_mul`). Returns
+/// `(decay_mask, attn0)`, both `(G,C,C)`. Semantics identical to the original
+/// candle op chain so CPU parity is preserved.
+fn decay_mask_attn0_fallback(
+    g_cs_g: &Tensor,
+    kk: &Tensor,
+    c: usize,
+    dev: &Device,
+) -> candle_core::Result<(Tensor, Tensor)> {
+    let lower_incl = tri_mask(c, |i, j| i >= j, dev)?;
+    let strict_lower = tri_mask(c, |i, j| i > j, dev)?;
+    // mask the diff BEFORE exp so masked-out upper entries can't overflow to inf.
+    let diff = g_cs_g.unsqueeze(2)?.broadcast_sub(&g_cs_g.unsqueeze(1)?)?; // (G,C,C)
+    let decay_mask = diff
+        .broadcast_mul(&lower_incl)?
+        .exp()?
+        .broadcast_mul(&lower_incl)?; // (G,C,C)
+    let attn0 = kk
+        .broadcast_mul(&decay_mask)?
+        .neg()?
+        .broadcast_mul(&strict_lower)?;
+    Ok((decay_mask, attn0))
 }
 
 /// CPU/non-CUDA fallback for the chunked delta-rule intra-chunk inverse:
