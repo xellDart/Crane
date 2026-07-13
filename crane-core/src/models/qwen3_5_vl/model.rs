@@ -1641,6 +1641,8 @@ pub struct TextDecoder {
 impl TextDecoder {
     /// `vb` must already be prefixed to the text stack (e.g. `vb.pp("language_model")`).
     pub fn new(cfg: &TextConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        #[cfg(feature = "cuda")]
+        crate::fused_ops::ensure_mempool_cached(&vb.device());
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);

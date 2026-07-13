@@ -850,6 +850,8 @@ pub struct TextDecoder {
 
 impl TextDecoder {
     pub fn new(cfg: &TextConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+        #[cfg(feature = "cuda")]
+        crate::fused_ops::ensure_mempool_cached(&vb.device());
         let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {

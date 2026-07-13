@@ -124,28 +124,9 @@ mod cuda {
             {
                 let mut ctx = cell.borrow_mut();
                 if ctx.is_none() {
-                    // Raise the async-alloc pool release threshold to max so freed
-                    // per-layer temporaries stay CACHED in the pool instead of being
-                    // returned to the OS on each free (the default threshold is 0, and
-                    // that release is a synchronizing op — with the FP8 path churning
-                    // large buffers every layer it serialized the whole model, slowing
-                    // even the GDN scan by ~60ms/page).
-                    unsafe {
-                        use candle_core::cuda_backend::cudarc::driver::sys as dsys;
-                        let cud = stream.context().cu_device();
-                        let mut pool = std::mem::MaybeUninit::uninit();
-                        if dsys::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), cud)
-                            == dsys::CUresult::CUDA_SUCCESS
-                        {
-                            let pool = pool.assume_init();
-                            let thr: u64 = u64::MAX;
-                            let _ = dsys::cuMemPoolSetAttribute(
-                                pool,
-                                dsys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-                                &thr as *const u64 as *mut std::ffi::c_void,
-                            );
-                        }
-                    }
+                    // Cache freed pool blocks (see ensure_mempool_cached) — critical
+                    // so the FP8 path's per-layer temp churn doesn't serialize the model.
+                    super::super::ensure_mempool_cached(x2p.device());
                     let handle = result::create_handle().map_err(w)?;
                     let wsb = ws_size();
                     let ws = stream.alloc_zeros::<u8>(wsb).map_err(w)?;
@@ -270,7 +251,9 @@ mod cuda {
             let op_n: i32 = 0;
             set(desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, &op_t)?;
             set(desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, &op_n)?;
-            let fast: i8 = 1;
+            // FAST_ACCUM trades accuracy for speed (FP8 accumulation). Default on;
+            // CRANE_FP8_FASTACC=0 uses full-precision accumulation for better parity.
+            let fast: i8 = if std::env::var("CRANE_FP8_FASTACC").map(|v| v == "0").unwrap_or(false) { 0 } else { 1 };
             set(desc, sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast)?;
 
             let pref = result::create_matmul_pref().map_err(w)?;

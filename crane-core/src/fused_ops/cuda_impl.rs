@@ -889,6 +889,36 @@ pub fn absmax_f32(x: &Tensor) -> Result<f32> {
     m.to_dtype(DType::F32)?.to_scalar::<f32>()
 }
 
+/// Raise the CUDA async-alloc pool release threshold to max, once per process.
+/// The default (0) returns freed memory to the OS on every free — a synchronizing
+/// op that, with heavy per-layer temporary churn, serializes the whole model.
+/// Caching freed blocks in the pool measurably speeds up the GDN scan (and any
+/// alloc-churning path), FP8 or not. Idempotent; safe to call on every load.
+pub fn ensure_mempool_cached(dev: &Device) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    let Device::Cuda(d) = dev else { return };
+    ONCE.call_once(|| {
+        let stream = d.cuda_stream();
+        unsafe {
+            use candle_core::cuda_backend::cudarc::driver::sys as dsys;
+            let cud = stream.context().cu_device();
+            let mut pool = std::mem::MaybeUninit::uninit();
+            if dsys::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), cud)
+                == dsys::CUresult::CUDA_SUCCESS
+            {
+                let pool = pool.assume_init();
+                let thr: u64 = u64::MAX;
+                let _ = dsys::cuMemPoolSetAttribute(
+                    pool,
+                    dsys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                    &thr as *const u64 as *mut std::ffi::c_void,
+                );
+            }
+        }
+    });
+}
+
 /// Fully on-device FP8 activation quant (no host sync): computes per-tensor absmax
 /// of bf16 `x`, quantizes to E4M3, and writes the activation scale into `a_scale`
 /// (a `[1]` f32 tensor read by cuBLASLt). `amax` is a `[1]` f32 scratch tensor.
