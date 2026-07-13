@@ -36,16 +36,22 @@ fn main() -> Result<()> {
         let doc_id = doc["document_id"].as_str().unwrap_or("?").to_string();
         let doc_type = doc["document_type"].as_str().unwrap_or("?").to_string();
 
-        let mut pages: Vec<(i64, PathBuf)> = doc["pages"]
-            .as_array()
-            .context("no pages")?
-            .iter()
-            .map(|p| {
-                let n = p["page"].as_i64().unwrap_or(0);
-                let f = p["file"].as_str().unwrap_or("");
-                (n, eval_dir.join(f))
-            })
-            .collect();
+        let mut pages: Vec<(i64, PathBuf)> = if let Some(arr) = doc["pages"].as_array() {
+            arr.iter()
+                .map(|p| {
+                    let n = p["page"].as_i64().unwrap_or(0);
+                    let f = p["file"].as_str().unwrap_or("");
+                    (n, eval_dir.join(f))
+                })
+                .collect()
+        } else {
+            // No explicit pages array: build from <eval_dir>/<document_id>/page_<n>.jpeg.
+            let total = doc["total_pages"].as_i64().unwrap_or(0);
+            (1..=total)
+                .map(|n| (n, eval_dir.join(&doc_id).join(format!("page_{}.jpeg", n))))
+                .filter(|(_, p)| p.exists())
+                .collect()
+        };
         pages.sort_by_key(|(n, _)| *n);
         let page_nums: Vec<i64> = pages.iter().map(|(n, _)| *n).collect();
         let page_paths: Vec<&Path> = pages.iter().map(|(_, p)| p.as_path()).collect();
@@ -94,7 +100,11 @@ fn main() -> Result<()> {
     }
 
     let out = json!({ "model_kind": kind, "record_id": root["record_id"], "documents": out_docs });
-    let out_path = eval_dir.join(format!("{}_results.json", kind));
+    // Optional 3rd arg: output filename suffix (e.g. "f32" -> colqwen3_5_f32_results.json).
+    let out_path = match args.get(3) {
+        Some(sfx) => eval_dir.join(format!("{}_{}_results.json", kind, sfx)),
+        None => eval_dir.join(format!("{}_results.json", kind)),
+    };
     std::fs::write(&out_path, serde_json::to_string_pretty(&out)?)?;
     println!(
         "wrote {} | {} docs, {} pages in {:.1}s",

@@ -778,11 +778,13 @@ fn gdn_prof_on() -> bool {
 }
 /// Whether the cross-chunk scan GEMMs + state recurrence run in bf16 (tensor-core)
 /// instead of F32. Decay math (cumsum/exp/decay_mask) and the intra-chunk inverse
-/// stay F32. Saves ~36ms/page but drifts a few L2-normalized token vectors
-/// (global cos ~0.998 vs F32), so it is **off by default** on this quality-first
-/// retrieval model — opt in with `CRANE_GDN_BF16=1`.
+/// stay F32. Saves ~36ms/page. Global embedding cos ~0.998 vs F32 (a few
+/// L2-normalized token vectors drift), BUT a full retrieval eval over 182 real
+/// queries showed NO meaningful change: top-1 identical 96%, and every top-1 flip
+/// is a score tie (gap ≤0.125); overlap with the ops anchor is 170 vs 169 (equal).
+/// So it is **on by default**; set `CRANE_GDN_BF16=0` to force the F32 path.
 fn gdn_bf16_on() -> bool {
-    std::env::var("CRANE_GDN_BF16").map(|v| v == "1").unwrap_or(false)
+    std::env::var("CRANE_GDN_BF16").map(|v| v != "0").unwrap_or(true)
 }
 fn gdn_prof_add(key: &'static str, s: f64) {
     GDN_PROF.with(|m| {
