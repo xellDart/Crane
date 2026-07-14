@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 crane-core = { path = "../crane-core" }
-candle-core = "0.9.2-alpha.2"
+candle-core = "0.11"
 anyhow = "1.0.100"
 image = "0.25.9"
 serde_json = "1.0"
