@@ -35,11 +35,15 @@ pub struct ColQwen3_5Config {
     pub vision_config: VisionConfig,
     pub text_config: TextConfig,
     pub image_token_id: u32,
+    // parsed from config.json for completeness; not read on the retrieval path
     #[serde(default)]
+    #[allow(dead_code)]
     pub video_token_id: u32,
     #[serde(default)]
+    #[allow(dead_code)]
     pub vision_start_token_id: u32,
     #[serde(default)]
+    #[allow(dead_code)]
     pub vision_end_token_id: u32,
     /// Retrieval projection dim (`dim` in config.json, 320 for Vultron).
     /// (config also carries a redundant `embed_dim`; we read `dim`.)

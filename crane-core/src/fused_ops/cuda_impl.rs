@@ -9,6 +9,7 @@ use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
 use candle_core::{DType, Device, Layout, Result, Shape, Tensor, WithDType};
 
 // PTX compiled from kernels/fused_ops.cu — embedded at build time.
+#[allow(dead_code)] // some kernels (e.g. fp8_bench_standalone) are built but not wired in
 mod ptx {
     include!(concat!(env!("OUT_DIR"), "/crane_kernels_ptx.rs"));
 }
