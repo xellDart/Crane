@@ -899,6 +899,14 @@ pub fn ensure_mempool_cached(dev: &Device) {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     let Device::Cuda(d) = dev else { return };
+    // Opt-in: hoarding freed blocks (release threshold = MAX) raises the VRAM
+    // high-water mark, which under a resident GPU cache + concurrent scoring can
+    // push a near-full 24GB device into OOM. Measured throughput gain was ~0, so
+    // default to the driver's release-on-sync behavior; set CRANE_MEMPOOL_CACHE=1
+    // to re-enable.
+    if std::env::var("CRANE_MEMPOOL_CACHE").map(|v| v != "1").unwrap_or(true) {
+        return;
+    }
     ONCE.call_once(|| {
         let stream = d.cuda_stream();
         unsafe {
